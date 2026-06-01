@@ -1,68 +1,49 @@
 import asyncio
-import httpx
-import os
-from bs4 import BeautifulSoup
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, Request
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 from supabase import create_client
-import uvicorn
+import os
 
+# --- НАСТРОЙКИ ---
+BOT_TOKEN = "8972261315:AAGlcYMX2sBdBKb880gI_Xvo0eYXDw-Q8Fs"
+SUPABASE_URL = "https://csibdzwhkkhsmmlkiyxk.supabase.co"
+SUPABASE_KEY = "sb_secret_SkHUDJEBH53YfqJBckMrYA_FqZGy0E6"
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI()
-supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-class MonitorTask(BaseModel):
-    url: str
-    target_price: float
-    chat_id: str
+# --- БОТ: Логика ---
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    # Кнопка для запуска Mini App
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="Открыть мониторинг", web_app=types.WebAppInfo(url="ССЫЛКА_НА_GITHUB_PAGES"))]
+    ])
+    await message.answer("Привет! Нажми кнопку, чтобы открыть панель управления.", reply_markup=kb)
 
-# --- ЛОГИКА МОНИТОРИНГА ---
-async def get_price(url):
-    try:
-        async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
-            resp = await client.get(url, follow_redirects=True)
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            price_text = soup.select_one(".price, [class*='price']").text
-            return float(''.join(filter(str.isdigit, price_text)))
-    except:
-        return None
+# --- БЭКЕНД: API для Mini App ---
+@app.post("/auth")
+async def auth(request: Request):
+    data = await request.json()
+    # Сохраняем в Supabase
+    supabase.table("users").insert({"id": data['id'], "username": data['username'], "password": data['password']}).execute()
+    return {"status": "ok"}
 
-async def run_monitor():
-    while True:
-        try:
-            tasks = supabase.table("monitors").select("*").execute().data
-            for task in tasks:
-                price = await get_price(task['url'])
-                if price and price <= task['target_price']:
-                    print(f"Нашел! Цена {price} для {task['chat_id']}")
-                await asyncio.sleep(2)
-        except Exception as e:
-            print(f"Ошибка мониторинга: {e}")
-        await asyncio.sleep(60)
-
-# --- API ЭНДПОИНТЫ ---
 @app.post("/add-task")
-async def add_task(task: MonitorTask):
-    data = supabase.table("monitors").insert({
-        "url": task.url, 
-        "target_price": task.target_price, 
-        "chat_id": task.chat_id
-    }).execute()
-    return {"status": "success", "data": data}
+async def add_task(request: Request):
+    data = await request.json()
+    supabase.table("monitors").insert({"user_id": data['id'], "url": data['url'], "target_type": data['type']}).execute()
+    return {"status": "task_saved"}
 
 # --- ЗАПУСК ---
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(run_monitor())
-
-
-
-from fastapi.responses import FileResponse
-
-@app.get("/")
-async def get_index():
-    return FileResponse("index.html")
-
+async def run_bot():
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("api_server:app", host="0.0.0.0", port=port)
+    # Запуск бота и FastAPI (через uvicorn)
+    import uvicorn
+    # Здесь используется фоновый процесс для бота
+    asyncio.run(run_bot())
