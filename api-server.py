@@ -20,3 +20,8 @@ async def add_task(task: MonitorTask):
         "chat_id": task.chat_id
     }).execute()
     return {"status": "success", "data": data}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)
