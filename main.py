@@ -14,8 +14,27 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI()
+import httpx
 
-# --- БОТ: Логика ---
+async def keep_alive():
+    url = "https://price-service-51a3.onrender.com" 
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                await client.get(url)
+                print("Ping sent!")
+            except Exception as e:
+                print(f"Ping error: {e}")
+            await asyncio.sleep(300) 
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(keep_alive())
+
+
+
+
+
 @dp.message(Command("start"))
 async def start(message: types.Message):
     # Кнопка для запуска Mini App
@@ -38,12 +57,16 @@ async def add_task(request: Request):
     supabase.table("monitors").insert({"user_id": data['id'], "url": data['url'], "target_type": data['type']}).execute()
     return {"status": "task_saved"}
 
-# --- ЗАПУСК ---
-async def run_bot():
-    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    # Запуск бота и FastAPI (через uvicorn)
+    # Запуск бота в фоновом режиме
+    async def start_bot():
+        await dp.start_polling(bot)
+
     import uvicorn
-    # Здесь используется фоновый процесс для бота
-    asyncio.run(run_bot())
+    import threading
+    
+    threading.Thread(target=lambda: asyncio.run(start_bot()), daemon=True).start()
+    
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
