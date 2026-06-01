@@ -58,15 +58,11 @@ async def add_task(request: Request):
     return {"status": "task_saved"}
 
 
+async def main():
+    await asyncio.gather(
+        dp.start_polling(bot),
+        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    )
 
 if __name__ == "__main__":
-    # Запуск бота в фоновом режиме
-    async def start_bot():
-        await dp.start_polling(bot)
-
-    import uvicorn
-    import threading
-    
-    threading.Thread(target=lambda: asyncio.run(start_bot()), daemon=True).start()
-    
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    asyncio.run(main())
