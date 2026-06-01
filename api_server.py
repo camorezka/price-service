@@ -54,6 +54,15 @@ async def add_task(task: MonitorTask):
 async def startup_event():
     asyncio.create_task(run_monitor())
 
+
+
+from fastapi.responses import FileResponse
+
+@app.get("/")
+async def get_index():
+    return FileResponse("index.html")
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run("api_server:app", host="0.0.0.0", port=port)
