@@ -51,6 +51,7 @@ async def keep_alive():
         while True:
             try:
                 await c.get(RENDER_URL)
+                print("Keep-alive ping OK")
             except Exception as e:
                 print("Ping error:", e)
             await asyncio.sleep(300)
@@ -65,20 +66,18 @@ async def startup_event():
 # HELPERS
 # =====================
 def get_client_ip(request: Request) -> str:
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    cf_ip = request.headers.get("cf-connecting-ip")
-    if cf_ip:
-        return cf_ip.strip()
+    for header in ["x-forwarded-for", "x-real-ip", "cf-connecting-ip"]:
+        val = request.headers.get(header)
+        if val:
+            return val.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
 def detect_platform(url: str) -> str:
-    host = urlparse(url).netloc.lower()
+    try:
+        host = urlparse(url).netloc.lower()
+    except:
+        return "unknown"
     if "binance" in host:                        return "binance"
     if "ozon" in host:                           return "ozon"
     if "wildberries" in host or "wb.ru" in host: return "wildberries"
@@ -87,104 +86,134 @@ def detect_platform(url: str) -> str:
     if "lamoda" in host:                         return "lamoda"
     if "adidas" in host:                         return "adidas"
     if "nike" in host:                           return "nike"
-    if "sneakersnstuff" in host:                 return "sneakersnstuff"
-    if "footlocker" in host:                     return "footlocker"
     if "zara" in host:                           return "zara"
     if "hm.com" in host:                         return "hm"
-    if any(x in host for x in ["cbr", "exchangerate", "currency", "investing"]): return "currency"
     return "unknown"
 
 
-CLOTHING_PLATFORMS = {"lamoda", "adidas", "nike", "zara", "hm", "sneakersnstuff", "footlocker", "aliexpress"}
+CLOTHING_PLATFORMS = {"lamoda", "adidas", "nike", "zara", "hm", "aliexpress"}
 
 
 # =====================
 # AI ANALYSIS
 # =====================
 async def analyze_product(url: str) -> dict:
-    platform   = detect_platform(url)
+    platform    = detect_platform(url)
     is_clothing = platform in CLOTHING_PLATFORMS
 
-    prompt = f"""
-Ты — аналитик цен и товаров. Тебе дана ссылка на товар: {url}
+    print(f"[ANALYZE] URL: {url} | Platform: {platform} | Clothing: {is_clothing}")
 
-Платформа определена как: {platform}
+    system_prompt = "Ты аналитик цен и товаров. Отвечай ТОЛЬКО валидным JSON без markdown блоков, без пояснений."
 
-Верни ТОЛЬКО JSON (без markdown, без пояснений):
+    user_prompt = f"""Проанализируй товар по ссылке: {url}
+Платформа: {platform}
+
+Верни строго валидный JSON в таком формате:
 {{
-  "name": "Название товара (придумай реалистичное для данной платформы)",
-  "category": "одна из: товары | одежда | обувь | крипта | электроника | косметика | еда | спорт",
-  "current_price": 0,
+  "name": "реалистичное название товара для платформы {platform}",
+  "category": "товары",
+  "current_price": 5990,
   "currency": "RUB",
-  "price_usd": 0,
+  "price_usd": 65,
   "price_history": [
-    {{"month": "Янв", "price": 0}},
-    {{"month": "Фев", "price": 0}},
-    {{"month": "Мар", "price": 0}},
-    {{"month": "Апр", "price": 0}},
-    {{"month": "Май", "price": 0}},
-    {{"month": "Июн", "price": 0}}
+    {{"month": "Янв", "price": 6200}},
+    {{"month": "Фев", "price": 6100}},
+    {{"month": "Мар", "price": 5800}},
+    {{"month": "Апр", "price": 6000}},
+    {{"month": "Май", "price": 5990}},
+    {{"month": "Июн", "price": 5990}}
   ],
   "forecast": {{
-    "drop_probability": 0,
-    "best_time_to_buy": "Напиши когда лучше купить",
-    "predicted_price_30d": 0,
-    "predicted_price_90d": 0
+    "drop_probability": 35,
+    "best_time_to_buy": "Через 2-3 недели",
+    "predicted_price_30d": 5500,
+    "predicted_price_90d": 5200
   }},
   "analytics": {{
-    "summary": "2-3 предложения о товаре и его ценовой динамике",
-    "usd_impact": "Как курс доллара влияет на цену этого товара",
-    "recommendation": "купить сейчас | подождать | отличная цена | цена завышена"
+    "summary": "Краткое описание товара и динамики цен в 2-3 предложения.",
+    "usd_impact": "Краткое описание влияния курса доллара на цену.",
+    "recommendation": "подождать"
   }},
   "is_clothing_or_shoes": {str(is_clothing).lower()},
   "alternatives": []
 }}
 
-Если это одежда или обувь (is_clothing_or_shoes = true), заполни alternatives — 3 похожих товара:
-[
-  {{
-    "name": "Название",
-    "price": 0,
-    "store": "Магазин",
-    "image_query": "поисковый запрос для картинки на английском (3-4 слова)"
-  }}
-]
-
-Цены придумай реалистичные. Курс USD/RUB ~ 90-95 руб.
-"""
-
-    response = await ai.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": "Ты аналитик цен. Отвечай ТОЛЬКО валидным JSON без markdown."},
-            {"role": "user",   "content": prompt}
-        ],
-        temperature=0.7,
-        max_tokens=1500
-    )
-
-    raw = response.choices[0].message.content.strip()
-    raw = re.sub(r"```json|```", "", raw).strip()
+Правила:
+- category: одно из товары, одежда, обувь, крипта, электроника, косметика, еда, спорт
+- recommendation: одно из "купить сейчас", "подождать", "отличная цена", "цена завышена"
+- Если is_clothing_or_shoes = true, добавь в alternatives 3 объекта: {{"name": "...", "price": 0, "store": "...", "image_query": "english search query"}}
+- Все цены в рублях, курс доллара ~92 руб
+- Верни ТОЛЬКО JSON, никакого текста вокруг"""
 
     try:
+        response = await ai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt}
+            ],
+            temperature=0.5,
+            max_tokens=1500
+        )
+
+        raw = response.choices[0].message.content.strip()
+        print(f"[OPENAI RAW]: {raw[:300]}")
+
+        # Убираем markdown если есть
+        raw = re.sub(r"```json\s*", "", raw)
+        raw = re.sub(r"```\s*", "", raw)
+        raw = raw.strip()
+
+        # Находим JSON если есть лишний текст
+        start = raw.find("{")
+        end   = raw.rfind("}") + 1
+        if start != -1 and end > start:
+            raw = raw[start:end]
+
         result = json.loads(raw)
         result["platform"] = platform
+        print(f"[ANALYZE OK] name={result.get('name')} price={result.get('current_price')}")
         return result
+
+    except json.JSONDecodeError as e:
+        print(f"[JSON ERROR] {e} | Raw: {raw[:500]}")
+        return _fallback(platform)
     except Exception as e:
-        print("JSON parse error:", e, "\nRaw:", raw)
-        return {
-            "name": "Товар",
-            "category": "товары",
-            "current_price": 1000,
-            "currency": "RUB",
-            "price_usd": 11,
-            "platform": platform,
-            "price_history": [],
-            "forecast": {"drop_probability": 30, "best_time_to_buy": "Через 1-2 месяца", "predicted_price_30d": 950, "predicted_price_90d": 900},
-            "analytics": {"summary": "Не удалось получить данные", "usd_impact": "Зависит от курса", "recommendation": "подождать"},
-            "is_clothing_or_shoes": False,
-            "alternatives": []
-        }
+        print(f"[OPENAI ERROR] {type(e).__name__}: {e}")
+        return _fallback(platform)
+
+
+def _fallback(platform: str) -> dict:
+    """Возвращает заглушку если OpenAI недоступен."""
+    return {
+        "name": "Товар с " + platform.capitalize(),
+        "category": "товары",
+        "current_price": 4990,
+        "currency": "RUB",
+        "price_usd": 54,
+        "platform": platform,
+        "price_history": [
+            {"month": "Янв", "price": 5500},
+            {"month": "Фев", "price": 5200},
+            {"month": "Мар", "price": 5000},
+            {"month": "Апр", "price": 4800},
+            {"month": "Май", "price": 5100},
+            {"month": "Июн", "price": 4990},
+        ],
+        "forecast": {
+            "drop_probability": 40,
+            "best_time_to_buy": "Через 1-2 месяца",
+            "predicted_price_30d": 4700,
+            "predicted_price_90d": 4400
+        },
+        "analytics": {
+            "summary": "Не удалось получить данные от ИИ. Показаны примерные данные.",
+            "usd_impact": "Цена зависит от курса доллара. При росте курса цена растёт.",
+            "recommendation": "подождать"
+        },
+        "is_clothing_or_shoes": False,
+        "alternatives": []
+    }
 
 
 # =====================
@@ -223,19 +252,21 @@ async def auth(request: Request):
         username = data.get("username", "")
         ip       = get_client_ip(request)
 
+        print(f"[AUTH] tg_id={tg_id} username={username} ip={ip}")
+
         if not tg_id:
             return JSONResponse({"status": "error", "message": "No Telegram ID"}, status_code=400)
 
-        # Check if already registered
-        existing = supabase.table("users").select("*").eq("tg_id", tg_id).execute()
+        existing = supabase.table("users").select("id").eq("tg_id", tg_id).execute()
+
         if existing.data:
             supabase.table("users").update({
                 "last_ip":   ip,
                 "last_seen": datetime.utcnow().isoformat()
             }).eq("tg_id", tg_id).execute()
-            return {"status": "ok", "already_registered": True, "user": existing.data[0]}
+            print(f"[AUTH] existing user tg_id={tg_id}")
+            return {"status": "ok", "already_registered": True}
 
-        # New registration
         supabase.table("users").insert({
             "tg_id":      tg_id,
             "username":   username,
@@ -245,10 +276,12 @@ async def auth(request: Request):
             "created_at": datetime.utcnow().isoformat()
         }).execute()
 
+        print(f"[AUTH] new user registered tg_id={tg_id}")
+
         try:
             await bot.send_message(
                 chat_id=tg_id,
-                text="✅ Вы зарегистрированы в Price Monitor!\n\nАккаунт привязан к вашему Telegram. Вход автоматический."
+                text="✅ Вы зарегистрированы в Price Monitor!\nВход автоматический через Telegram."
             )
         except Exception as tg_err:
             print("TG notify error:", tg_err)
@@ -256,7 +289,7 @@ async def auth(request: Request):
         return {"status": "ok", "already_registered": False}
 
     except Exception as e:
-        print("AUTH ERROR:", e)
+        print(f"[AUTH ERROR] {e}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
@@ -267,26 +300,36 @@ async def analyze(request: Request):
         url   = data.get("url", "").strip()
         tg_id = data.get("id")
 
+        print(f"[ANALYZE REQUEST] url={url} tg_id={tg_id}")
+
         if not url:
-            return JSONResponse({"status": "error", "message": "URL is required"}, status_code=400)
+            return JSONResponse({"status": "error", "message": "URL обязателен"}, status_code=400)
+
+        if not url.startswith("http"):
+            url = "https://" + url
 
         result = await analyze_product(url)
 
-        if tg_id:
-            supabase.table("monitors").insert({
-                "tg_id":    tg_id,
-                "url":      url,
-                "platform": result.get("platform", "unknown"),
-                "category": result.get("category", "товары"),
-                "name":     result.get("name", ""),
-                "price":    result.get("current_price", 0),
-                "added_at": datetime.utcnow().isoformat()
-            }).execute()
+        # Сохраняем в БД
+        try:
+            if tg_id:
+                supabase.table("monitors").insert({
+                    "tg_id":    tg_id,
+                    "url":      url,
+                    "platform": result.get("platform", "unknown"),
+                    "category": result.get("category", "товары"),
+                    "name":     result.get("name", ""),
+                    "price":    result.get("current_price", 0),
+                    "added_at": datetime.utcnow().isoformat()
+                }).execute()
+        except Exception as db_err:
+            print(f"[DB ERROR] {db_err}")
+            # Не фейлим запрос из-за ошибки БД
 
         return {"status": "ok", "data": result}
 
     except Exception as e:
-        print("ANALYZE ERROR:", e)
+        print(f"[ANALYZE ERROR] {type(e).__name__}: {e}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
