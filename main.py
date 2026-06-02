@@ -58,11 +58,20 @@ async def add_task(request: Request):
     return {"status": "task_saved"}
 
 
-async def main():
-    await asyncio.gather(
-        dp.start_polling(bot),
-        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-    )
-
 if __name__ == "__main__":
-    asyncio.run(main())
+ 
+    config = uvicorn.Config(
+        app=app, 
+        host="0.0.0.0", 
+        port=int(os.environ.get("PORT", 8000)),
+        loop="asyncio"
+    )
+    server = uvicorn.Server(config)
+    
+    async def run_all():
+        await asyncio.gather(
+            dp.start_polling(bot),
+            server.serve()
+        )
+    
+    asyncio.run(run_all())
