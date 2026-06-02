@@ -16,9 +16,12 @@ from supabase import create_client
 
 
 # --- НАСТРОЙКИ ---
-BOT_TOKEN = "8972261315:AAGlcYMX2sBdBKb880gI_Xvo0eYXDw-Q8Fs"
-SUPABASE_URL = "https://csibdzwhkkhsmmlkiyxk.supabase.co"
-SUPABASE_KEY = "sb_secret_SkHUDJEBH53YfqJBckMrYA_FqZGy0E6"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -31,9 +34,8 @@ supabase = create_client(
 app = FastAPI()
 
 client = AsyncOpenAI(
-    api_key="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"
+    api_key=os.getenv("OPENAI_API_KEY")
 )
-
 
 # =====================
 # CORS
