@@ -34,7 +34,7 @@ async def startup_event():
 @dp.message(Command("start"))
 async def start(message: types.Message):
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="Открыть мониторинг", web_app=types.WebAppInfo(url="ССЫЛКА_НА_GITHUB_PAGES"))]
+        [types.InlineKeyboardButton(text="Открыть мониторинг", web_app=types.WebAppInfo(url="https://camorezka.github.io/price-service-site/"))]
     ])
     await message.answer("Привет! Нажми кнопку.", reply_markup=kb)
 
