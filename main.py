@@ -41,7 +41,21 @@ async def start(message: types.Message):
 @app.post("/auth")
 async def auth(request: Request):
     data = await request.json()
-    supabase.table("users").insert({"id": data['id'], "username": data['username'], "password": data['password']}).execute()
+
+    supabase.table("users").insert({
+        "id": data['id'],
+        "username": data['username'],
+        "password": data['password']
+    }).execute()
+
+    try:
+        await bot.send_message(
+            chat_id=data["id"],
+            text="✅ Регистрация выполнена"
+        )
+    except Exception as e:
+        print("Telegram error:", e)
+
     return {"status": "ok"}
 
 @app.post("/add-task")
