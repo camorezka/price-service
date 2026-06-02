@@ -2,7 +2,10 @@ import asyncio
 import os
 import uvicorn
 import httpx
+import json
+from urllib.parse import urlparse
 
+from openai import AsyncOpenAI
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -27,10 +30,14 @@ supabase = create_client(
 
 app = FastAPI()
 
+client = AsyncOpenAI(
+    api_key="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"
+)
+
+
 # =====================
 # CORS
 # =====================
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,30 +46,119 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # =====================
 # KEEP ALIVE
 # =====================
-
 async def keep_alive():
     url = "https://price-service-51a3.onrender.com"
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient() as client_http:
         while True:
             try:
-                await client.get(url)
+                await client_http.get(url)
             except Exception as e:
                 print("Ping error:", e)
 
             await asyncio.sleep(300)
 
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(keep_alive())
 
-# =====================
-# BOT
-# =====================
 
+# =====================
+# PLATFORM DETECTION
+# =====================
+def detect_platform(url: str):
+    host = urlparse(url).netloc.lower()
+
+    if "binance" in host:
+        return "binance"
+
+    if "ozon" in host:
+        return "ozon"
+
+    if "wildberries" in host or "wb.ru" in host:
+        return "wildberries"
+
+    if any(x in host for x in ["cbr", "bank", "exchangerate", "currency"]):
+        return "currency"
+
+    return "unknown"
+
+
+def detect_monitoring_type(platform: str, url: str):
+    if platform == "binance":
+        return "crypto_price"
+
+    if platform in ["ozon", "wildberries"]:
+        return "price"
+
+    if platform == "currency":
+        return "currency_rate"
+
+    return "general"
+
+
+# =====================
+# AI ANALYSIS (HYBRID)
+# =====================
+async def analyze_url(url: str):
+    platform = detect_platform(url)
+    monitor_type = detect_monitoring_type(platform, url)
+
+    # deterministic result (no GPT needed)
+    if platform != "unknown":
+        return {
+            "supported": True,
+            "category": platform,
+            "type": monitor_type,
+            "reason": f"Auto-detected platform: {platform}"
+        }
+
+    # fallback GPT
+    response = await client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": """
+Ты анализируешь ссылки для сервиса мониторинга.
+
+Верни ТОЛЬКО JSON:
+{
+  "supported": true,
+  "category": "crypto|shop|currency|unknown",
+  "type": "price|crypto_price|currency_rate|general",
+  "reason": "..."
+}
+"""
+            },
+            {
+                "role": "user",
+                "content": url
+            }
+        ]
+    )
+
+    raw = response.choices[0].message.content
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {
+            "supported": False,
+            "category": "unknown",
+            "type": "general",
+            "reason": "Failed to parse AI response"
+        }
+
+
+# =====================
+# BOT HANDLERS
+# =====================
 @dp.message(Command("start"))
 async def start(message: types.Message):
 
@@ -84,13 +180,14 @@ async def start(message: types.Message):
         reply_markup=keyboard
     )
 
+
 # =====================
 # API
 # =====================
-
 @app.get("/")
 async def root():
     return {"status": "ok"}
+
 
 @app.post("/auth")
 async def auth(request: Request):
@@ -123,45 +220,62 @@ async def auth(request: Request):
             "message": str(e)
         }
 
+
 @app.post("/add-task")
 async def add_task(request: Request):
-    try:
-        data = await request.json()
+    data = await request.json()
 
-        print("TASK REQUEST:", data)
+    print("TASK REQUEST:", data)
 
-        supabase.table("monitors").insert({
-            "user_id": data["id"],
-            "url": data["url"],
-            "target_type": data["type"]
-        }).execute()
+    analysis = await analyze_url(data["url"])
 
+    # safety: иногда приходит строка
+    if isinstance(analysis, str):
         try:
-            await bot.send_message(
-                chat_id=data["id"],
-                text=(
-                    "✅ Мониторинг добавлен\n\n"
-                    f"Ссылка: {data['url']}\n"
-                    f"Тип: {data['type']}"
-                )
-            )
-        except Exception as tg_error:
-            print("Telegram error:", tg_error)
+            analysis = json.loads(analysis)
+        except:
+            return {
+                "status": "error",
+                "message": "Invalid AI response"
+            }
 
-        return {"status": "task_saved"}
-
-    except Exception as e:
-        print("TASK ERROR:", e)
-
+    if not analysis.get("supported", False):
         return {
             "status": "error",
-            "message": str(e)
+            "message": analysis.get("reason", "Not supported")
         }
+
+    supabase.table("monitors").insert({
+        "user_id": data["id"],
+        "url": data["url"],
+        "target_type": analysis.get("type", data["type"]),
+        "platform": analysis.get("category", "unknown")
+    }).execute()
+
+    try:
+        await bot.send_message(
+            chat_id=data["id"],
+            text=(
+                "✅ Мониторинг добавлен\n\n"
+                f"Ссылка: {data['url']}\n"
+                f"Тип: {analysis.get('type', data['type'])}"
+            )
+        )
+
+        await bot.send_message(
+            chat_id=data["id"],
+            text=f"📊 Категория: {analysis.get('category')}\n💡 {analysis.get('reason')}"
+        )
+
+    except Exception as tg_error:
+        print("Telegram error:", tg_error)
+
+    return {"status": "task_saved"}
+
 
 # =====================
 # SERVER
 # =====================
-
 async def run_api():
     config = uvicorn.Config(
         app,
@@ -173,15 +287,16 @@ async def run_api():
 
     await server.serve()
 
+
 # =====================
 # MAIN
 # =====================
-
 async def main():
     await asyncio.gather(
         dp.start_polling(bot),
         run_api()
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
