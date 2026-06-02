@@ -5,3 +5,4 @@ supabase
 python-dotenv
 httpx
 beautifulsoup4
+openai
