@@ -783,6 +783,28 @@ async def admin_get_user(username: str, request: Request):
     monitors = supabase.table("crypto_monitors").select("*").eq("tg_id", u["tg_id"]).execute()
     return {"status": "ok", "user": u, "monitors": monitors.data or []}
 
-# Запуск сервиса
+
+@app.post("/activate-monitor")
+async def activate_monitor(data: dict):
+    tg_id = data.get("tg_id")
+    symbol = data.get("symbol")
+    
+    monitor = supabase.table("crypto_monitors").select("*").eq("tg_id", tg_id).eq("symbol", symbol).execute()
+    if monitor.data:
+        m = monitor.data[0]
+        if m['alerts_count'] >= 3:
+            return {"status": "error", "message": "Лимит на 7 дней исчерпан"}
+        
+        supabase.table("crypto_monitors").update({
+            "alerts_count": m['alerts_count'] + 1,
+            "last_alerted": datetime.now(timezone.utc).isoformat()
+        }).eq("id", m['id']).execute()
+        
+    return {"status": "ok"}
+
+
+
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=False)
