@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from supabase import create_client
+import random  # импорт один раз сверху
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -20,6 +21,19 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 RENDER_URL   = os.getenv("RENDER_URL", "https://price-service-51a3.onrender.com")
 ADMIN_TG_ID  = 1693493298
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+
+# Глобальный httpx клиент
+HTTP_CLIENT = httpx.AsyncClient(
+    timeout=httpx.Timeout(12.0),
+    limits=httpx.Limits(
+        max_connections=100,
+        max_keepalive_connections=20
+    ),
+    headers={
+        "User-Agent": "CryptoSpace/4.0"
+    }
+)
 
 bot      = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp       = Dispatcher()
@@ -51,94 +65,117 @@ def safe_float(val, default: float = 0.0) -> float:
         return default
 
 def fmt_price(p: float) -> str:
-    if p >= 1000:  return f"${p:,.2f}"
-    if p >= 1:     return f"${p:.2f}"
-    if p >= 0.01:  return f"${p:.4f}"
+    if p >= 1000:
+        return f"${p:,.2f}"
+    if p >= 1:
+        return f"${p:.2f}"
+    if p >= 0.01:
+        return f"${p:.4f}"
     return f"${p:.6f}"
 
+# ── SHUTDOWN ─────────────────────────────────────────────────────────────────
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await HTTP_CLIENT.aclose()
 
 # ── KEEP-ALIVE ────────────────────────────────────────────────────────────────
 
 async def keep_alive():
-    async with httpx.AsyncClient() as c:
-        while True:
-            try:
-                await c.get(RENDER_URL, timeout=10)
-            except Exception as e:
-                log.warning("[PING] %s", e)
-            await asyncio.sleep(280)
-
+    while True:
+        try:
+            await HTTP_CLIENT.get(RENDER_URL, timeout=10)
+        except Exception as e:
+            log.warning("[PING] %s", e)
+        await asyncio.sleep(280)
 
 # ── CRYPTO PRICE ──────────────────────────────────────────────────────────────
 
 async def fetch_crypto_price(symbol: str, exchange: str):
     sym = symbol.upper().strip()
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            if exchange == "binance":
-                for q in ("USDT", "USDC", "BUSD"):
-                    try:
-                        r = await c.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": sym + q})
-                        px = safe_float(r.json().get("price"))
-                        if px > 0: return px
-                    except Exception: continue
+        if exchange == "binance":
+            for q in ("USDT", "USDC", "BUSD"):
+                try:
+                    r = await HTTP_CLIENT.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": sym + q})
+                    r.raise_for_status()
+                    px = safe_float(r.json().get("price"))
+                    if px > 0:
+                        return px
+                except:
+                    continue
 
-            elif exchange == "bybit":
-                r = await c.get("https://api.bybit.com/v5/market/tickers", params={"category": "spot", "symbol": sym + "USDT"})
-                lst = r.json().get("result", {}).get("list", [])
-                if lst:
-                    px = safe_float(lst[0].get("lastPrice"))
-                    if px > 0: return px
+        elif exchange == "bybit":
+            r = await HTTP_CLIENT.get("https://api.bybit.com/v5/market/tickers", params={"category": "spot", "symbol": sym + "USDT"})
+            r.raise_for_status()
+            lst = r.json().get("result", {}).get("list", [])
+            if lst:
+                px = safe_float(lst[0].get("lastPrice"))
+                if px > 0:
+                    return px
 
-            elif exchange == "okx":
-                r = await c.get("https://www.okx.com/api/v5/market/ticker", params={"instId": sym + "-USDT"})
-                lst = r.json().get("data", [])
-                if lst:
-                    px = safe_float(lst[0].get("last"))
-                    if px > 0: return px
+        elif exchange == "okx":
+            r = await HTTP_CLIENT.get("https://www.okx.com/api/v5/market/ticker", params={"instId": sym + "-USDT"})
+            r.raise_for_status()
+            lst = r.json().get("data", [])
+            if lst:
+                px = safe_float(lst[0].get("last"))
+                if px > 0:
+                    return px
 
-            elif exchange == "kucoin":
-                r = await c.get("https://api.kucoin.com/api/v1/market/orderbook/level1", params={"symbol": sym + "-USDT"})
-                d = r.json().get("data") or {}
+        elif exchange == "kucoin":
+            r = await HTTP_CLIENT.get("https://api.kucoin.com/api/v1/market/orderbook/level1", params={"symbol": sym + "-USDT"})
+            r.raise_for_status()
+            d = r.json().get("data") or {}
+            px = safe_float(d.get("price"))
+            if px > 0:
+                return px
+
+        elif exchange == "htx":
+            r = await HTTP_CLIENT.get("https://api.huobi.pro/market/detail/merged", params={"symbol": sym.lower() + "usdt"})
+            r.raise_for_status()
+            tick = r.json().get("tick") or {}
+            px = safe_float(tick.get("close"))
+            if px > 0:
+                return px
+
+        elif exchange == "gate":
+            r = await HTTP_CLIENT.get("https://api.gateio.ws/api/v4/spot/tickers", params={"currency_pair": sym + "_USDT"})
+            r.raise_for_status()
+            lst = r.json()
+            if isinstance(lst, list) and lst:
+                px = safe_float(lst[0].get("last"))
+                if px > 0:
+                    return px
+
+        elif exchange == "mexc":
+            r = await HTTP_CLIENT.get("https://api.mexc.com/api/v3/ticker/price", params={"symbol": sym + "USDT"})
+            r.raise_for_status()
+            d = r.json()
+            if "code" not in d:
                 px = safe_float(d.get("price"))
-                if px > 0: return px
+                if px > 0:
+                    return px
 
-            elif exchange == "htx":
-                r = await c.get("https://api.huobi.pro/market/detail/merged", params={"symbol": sym.lower() + "usdt"})
-                tick = r.json().get("tick") or {}
-                px = safe_float(tick.get("close"))
-                if px > 0: return px
+        elif exchange == "coinbase":
+            r = await HTTP_CLIENT.get(f"https://api.coinbase.com/v2/prices/{sym}-USD/spot")
+            r.raise_for_status()
+            px = safe_float(r.json().get("data", {}).get("amount"))
+            if px > 0:
+                return px
 
-            elif exchange == "gate":
-                r = await c.get("https://api.gateio.ws/api/v4/spot/tickers", params={"currency_pair": sym + "_USDT"})
-                lst = r.json()
-                if isinstance(lst, list) and lst:
-                    px = safe_float(lst[0].get("last"))
-                    if px > 0: return px
-
-            elif exchange == "mexc":
-                r = await c.get("https://api.mexc.com/api/v3/ticker/price", params={"symbol": sym + "USDT"})
-                d = r.json()
-                if "code" not in d:
-                    px = safe_float(d.get("price"))
-                    if px > 0: return px
-
-            elif exchange == "coinbase":
-                r = await c.get(f"https://api.coinbase.com/v2/prices/{sym}-USD/spot")
-                px = safe_float(r.json().get("data", {}).get("amount"))
-                if px > 0: return px
-
-            elif exchange == "kraken":
-                ksym = "XBT" if sym == "BTC" else sym
-                r = await c.get("https://api.kraken.com/0/public/Ticker", params={"pair": ksym + "USD"})
-                for v in r.json().get("result", {}).values():
-                    px = safe_float(v["c"][0])
-                    if px > 0: return px
+        elif exchange == "kraken":
+            ksym = "XBT" if sym == "BTC" else sym
+            r = await HTTP_CLIENT.get("https://api.kraken.com/0/public/Ticker", params={"pair": ksym + "USD"})
+            r.raise_for_status()
+            for v in r.json().get("result", {}).values():
+                px = safe_float(v["c"][0])
+                if px > 0:
+                    return px
 
     except Exception as e:
         log.warning("[PRICE %s/%s] %s", exchange, sym, e)
     return None
-
 
 # ── COINGECKO 7d HISTORY + CHANGES ───────────────────────────────────────────
 
@@ -156,27 +193,30 @@ async def fetch_coingecko_data(symbol: str):
     if not cg_id:
         return None, None, None
     try:
-        async with httpx.AsyncClient(timeout=12) as c:
-            r = await c.get(
-                f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart",
-                params={"vs_currency": "usd", "days": "7", "interval": "daily"},
-                headers={"Accept": "application/json"},
-            )
-            d = r.json()
-            prices = d.get("prices", [])
-            if len(prices) >= 7:
-                days_label = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
-                history = [{"day": days_label[i % 7], "price": round(p[1], 6)} for i, p in enumerate(prices[-7:])]
-                p_first = prices[-7][1]
-                p_last  = prices[-1][1]
-                p_prev  = prices[-2][1] if len(prices) >= 2 else p_last
-                chg24   = round((p_last - p_prev)  / p_prev  * 100, 2) if p_prev  > 0 else 0.0
-                chg7    = round((p_last - p_first) / p_first * 100, 2) if p_first > 0 else 0.0
-                return history, chg24, chg7
+        # БЕЗ async with
+        r = await HTTP_CLIENT.get(
+            f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart",
+            params={"vs_currency": "usd", "days": "7", "interval": "daily"},
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "CryptoSpace/4.0"
+            }
+        )
+        r.raise_for_status()
+        d = r.json()
+        prices = d.get("prices", [])
+        if len(prices) >= 7:
+            days_label = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
+            history = [{"day": days_label[i % 7], "price": round(p[1], 6)} for i, p in enumerate(prices[-7:])]
+            p_first = prices[-7][1]
+            p_last  = prices[-1][1]
+            p_prev  = prices[-2][1] if len(prices) >= 2 else p_last
+            chg24   = round((p_last - p_prev)  / p_prev  * 100, 2) if p_prev  > 0 else 0.0
+            chg7    = round((p_last - p_first) / p_first * 100, 2) if p_first > 0 else 0.0
+            return history, chg24, chg7
     except Exception as e:
         log.warning("[COINGECKO %s] %s", symbol, e)
     return None, None, None
-
 
 # ── COIN META & INFO from CoinGecko ──────────────────────────────────────────
 
@@ -237,14 +277,13 @@ def build_review(symbol: str, is_forex: bool) -> tuple:
 # ── CRYPTO ANALYZE ────────────────────────────────────────────────────────────
 
 async def analyze_crypto(symbol: str, exchange: str, live_price):
-    sym  = symbol.upper()
+    sym = symbol.upper()
     name = COIN_NAMES.get(sym, sym)
-    p    = live_price if (live_price and live_price > 0) else 1.0
+    p = live_price if (live_price and live_price > 0) else 1.0
 
     history, chg24, chg7 = await fetch_coingecko_data(sym)
     if not history:
-        days = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
-        import random
+        days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
         history = [{"day": d, "price": round(p * (0.97 + random.random() * 0.06), 6)} for d in days]
         history[-1]["price"] = p
         chg24 = chg7 = 0.0
@@ -254,29 +293,29 @@ async def analyze_crypto(symbol: str, exchange: str, live_price):
 
     review_text, recommendation = build_review(sym, False)
 
-    rec_map = {"купить": "green", "накапливать": "green", "продать": "red", "держать": "yellow"}
-
     return {
-        "name": name, "symbol": sym, "exchange": exchange,
+        "name": name,
+        "symbol": sym,
+        "exchange": exchange,
         "description": review_text,
         "current_price_usd": p,
         "price_history_7d": history,
         "change_24h": chg24 or 0.0,
-        "change_7d":  chg7  or 0.0,
+        "change_7d": chg7 or 0.0,
         "forecast": {
-            "predicted_7d":  round(p * (1.03 if (chg7 or 0) >= 0 else 0.97), 6),
+            "predicted_7d": round(p * (1.03 if (chg7 or 0) >= 0 else 0.97), 6),
             "predicted_30d": round(p * (1.08 if (chg7 or 0) >= 0 else 0.94), 6),
-            "trend":         "bullish" if (chg7 or 0) >= 0 else "bearish",
-            "confidence":    62,
-            "support":       round(p * 0.92, 6),
-            "resistance":    round(p * 1.10, 6),
+            "trend": "bullish" if (chg7 or 0) >= 0 else "bearish",
+            "confidence": 62,
+            "support": round(p * 0.92, 6),
+            "resistance": round(p * 1.10, 6),
         },
         "ai_analysis": {
-            "summary":        review_text,
-            "risks":          "Волатильность рынка, регуляторные новости.",
-            "opportunity":    "Следите за объёмами и уровнями поддержки.",
+            "summary": review_text,
+            "risks": "Волатильность рынка, регуляторные новости.",
+            "opportunity": "Следите за объёмами и уровнями поддержки.",
             "recommendation": recommendation,
-            "sentiment":      "позитивный" if (chg24 or 0) >= 0 else "осторожный",
+            "sentiment": "позитивный" if (chg24 or 0) >= 0 else "осторожный",
         },
         "metrics": {
             "volatility": "высокая" if abs(chg24 or 0) > 3 else "средняя",
@@ -284,148 +323,147 @@ async def analyze_crypto(symbol: str, exchange: str, live_price):
         },
     }
 
-
 # ── FOREX ANALYZE ─────────────────────────────────────────────────────────────
 
-FOREX_NAMES = {
-    "USD": "Доллар США", "EUR": "Евро", "GBP": "Британский фунт",
-    "JPY": "Японская иена", "CHF": "Швейцарский франк", "CNY": "Китайский юань",
-    "CAD": "Канадский доллар", "AUD": "Австралийский доллар", "UAH": "Украинская гривна",
-    "RUB": "Российский рубль", "TRY": "Турецкая лира", "BRL": "Бразильский реал",
-    "INR": "Индийская рупия", "MXN": "Мексиканское песо", "PLN": "Польский злотый",
-    "SEK": "Шведская крона", "NOK": "Норвежская крона", "DKK": "Датская крона",
-    "SGD": "Сингапурский доллар", "HKD": "Гонконгский доллар", "NZD": "Новозеландский доллар",
-    "KZT": "Казахстанский тенге", "GEL": "Грузинский лари", "AED": "Дирхам ОАЭ",
-    "SAR": "Саудовский риял",
-}
-
 async def fetch_forex_rate(base: str, quote: str = "USD"):
-    base = base.upper(); quote = quote.upper()
-    if base == quote: return 1.0
+    base = base.upper()
+    quote = quote.upper()
+    if base == quote:
+        return 1.0
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            try:
-                r = await c.get(f"https://open.er-api.com/v6/latest/{base}")
-                d = r.json()
-                if d.get("result") == "success":
-                    rate = safe_float(d.get("rates", {}).get(quote))
-                    if rate > 0: return rate
-            except Exception: pass
-            try:
-                r = await c.get("https://api.frankfurter.app/latest", params={"from": base, "to": quote})
-                rate = safe_float(r.json().get("rates", {}).get(quote))
-                if rate > 0: return rate
-            except Exception: pass
+        # Используем глобальный HTTP_CLIENT без async with
+        r = await HTTP_CLIENT.get(f"https://open.er-api.com/v6/latest/{base}")
+        r.raise_for_status()
+        d = r.json()
+        if d.get("result") == "success":
+            rate = safe_float(d.get("rates", {}).get(quote))
+            if rate > 0:
+                return rate
+        # Второй источник
+        r2 = await HTTP_CLIENT.get("https://api.frankfurter.app/latest", params={"from": base, "to": quote})
+        r2.raise_for_status()
+        rate = safe_float(r2.json().get("rates", {}).get(quote))
+        if rate > 0:
+            return rate
     except Exception as e:
         log.warning("[FOREX %s/%s] %s", base, quote, e)
     return None
 
 async def analyze_forex(base: str, quote: str, live_rate):
     rate = live_rate if (live_rate and live_rate > 0) else 1.0
-    base_name  = FOREX_NAMES.get(base,  base)
+    base_name = FOREX_NAMES.get(base, base)
     quote_name = FOREX_NAMES.get(quote, quote)
 
-    import random
-    days = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
+    days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    # Используем глобальный HTTP_CLIENT
     history = [{"day": d, "rate": round(rate * (0.985 + random.random() * 0.03), 6)} for d in days]
     history[-1]["rate"] = rate
 
-    p_first = history[0]["rate"]; p_last = history[-1]["rate"]
+    p_first = history[0]["rate"]
+    p_last = history[-1]["rate"]
     chg7 = round((p_last - p_first) / p_first * 100, 2) if p_first > 0 else 0.0
 
     review_text, recommendation = build_review(base, True)
 
     return {
-        "base": base, "quote": quote,
-        "base_name": base_name, "quote_name": quote_name,
+        "base": base,
+        "quote": quote,
+        "base_name": base_name,
+        "quote_name": quote_name,
         "description": review_text,
         "current_rate": rate,
         "rate_history_7d": history,
         "change_24h": 0.0,
-        "change_7d":  chg7,
+        "change_7d": chg7,
         "forecast": {
-            "predicted_7d":  round(rate * (1.005 if chg7 >= 0 else 0.995), 6),
+            "predicted_7d": round(rate * (1.005 if chg7 >= 0 else 0.995), 6),
             "predicted_30d": round(rate * (1.015 if chg7 >= 0 else 0.985), 6),
-            "trend":         "bullish" if chg7 >= 0 else "bearish",
-            "confidence":    58,
+            "trend": "bullish" if chg7 >= 0 else "bearish",
+            "confidence": 58,
         },
         "ai_analysis": {
-            "summary":        review_text,
-            "factors":        "Процентные ставки ЦБ, инфляция, торговый баланс.",
+            "summary": review_text,
+            "factors": "Процентные ставки ЦБ, инфляция, торговый баланс.",
             "recommendation": recommendation,
-            "sentiment":      "позитивный" if chg7 >= 0 else "осторожный",
+            "sentiment": "позитивный" if chg7 >= 0 else "осторожный",
         },
     }
 
-
 # ── COINS LIST FROM EXCHANGE ──────────────────────────────────────────────────
 
-TOP20 = ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","TON","AVAX","DOT",
-         "MATIC","LINK","UNI","LTC","ATOM","NEAR","OP","ARB","APT","SUI"]
+TOP20 = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TON", "AVAX", "DOT",
+         "MATIC", "LINK", "UNI", "LTC", "ATOM", "NEAR", "OP", "ARB", "APT", "SUI"]
 
 async def fetch_exchange_coins(exchange: str):
     try:
-        async with httpx.AsyncClient(timeout=12) as c:
+        # Используем глобальный HTTP_CLIENT
+        async with HTTP_CLIENT as c:
             if exchange == "binance":
                 r = await c.get("https://api.binance.com/api/v3/ticker/24hr")
+                r.raise_for_status()
                 data = r.json()
                 coins = []
                 seen = set()
                 for item in data:
-                    s = item.get("symbol","")
+                    s = item.get("symbol", "")
                     if s.endswith("USDT"):
                         sym = s[:-4]
                         if sym not in seen:
                             seen.add(sym)
-                            coins.append({"sym": sym, "name": COIN_NAMES.get(sym, sym),
-                                          "vol": safe_float(item.get("quoteVolume")),
-                                          "chg": round(safe_float(item.get("priceChangePercent")), 2)})
+                            coins.append({
+                                "sym": sym,
+                                "name": COIN_NAMES.get(sym, sym),
+                                "vol": safe_float(item.get("quoteVolume")),
+                                "chg": round(safe_float(item.get("priceChangePercent")), 2)
+                            })
                 coins.sort(key=lambda x: x["vol"], reverse=True)
                 return coins[:100]
-
             if exchange == "bybit":
                 r = await c.get("https://api.bybit.com/v5/market/tickers", params={"category": "spot"})
+                r.raise_for_status()
                 lst = r.json().get("result", {}).get("list", [])
                 coins = []
                 seen = set()
                 for item in lst:
-                    s = item.get("symbol","")
+                    s = item.get("symbol", "")
                     if s.endswith("USDT"):
                         sym = s[:-4]
                         if sym not in seen:
                             seen.add(sym)
-                            coins.append({"sym": sym, "name": COIN_NAMES.get(sym, sym),
-                                          "vol": safe_float(item.get("volume24h")),
-                                          "chg": round(safe_float(item.get("price24hPcnt","0")) * 100, 2)})
+                            coins.append({
+                                "sym": sym,
+                                "name": COIN_NAMES.get(sym, sym),
+                                "vol": safe_float(item.get("volume24h")),
+                                "chg": round(safe_float(item.get("price24hPcnt", "0")) * 100, 2)
+                            })
                 coins.sort(key=lambda x: x["vol"], reverse=True)
                 return coins[:100]
-
             if exchange == "okx":
                 r = await c.get("https://www.okx.com/api/v5/market/tickers", params={"instType": "SPOT"})
+                r.raise_for_status()
                 lst = r.json().get("data", [])
                 coins = []
                 seen = set()
                 for item in lst:
-                    s = item.get("instId","")
+                    s = item.get("instId", "")
                     if s.endswith("-USDT"):
                         sym = s[:-5]
                         if sym not in seen:
                             seen.add(sym)
-                            coins.append({"sym": sym, "name": COIN_NAMES.get(sym, sym),
-                                          "vol": safe_float(item.get("volCcy24h")),
-                                          "chg": 0.0})
+                            coins.append({
+                                "sym": sym,
+                                "name": COIN_NAMES.get(sym, sym),
+                                "vol": safe_float(item.get("volCcy24h")),
+                                "chg": 0.0
+                            })
                 coins.sort(key=lambda x: x["vol"], reverse=True)
                 return coins[:100]
-
-            if exchange in ("kucoin", "gate", "mexc", "coinbase", "kraken", "htx", "kraken"):
-                # Для остальных бирж — топ20 захардкоженных
+            if exchange in ("kucoin", "gate", "mexc", "coinbase", "kraken", "htx"):
+                # Для остальных — топ20 захардкоженных
                 return [{"sym": s, "name": COIN_NAMES.get(s, s), "vol": 0, "chg": 0.0} for s in TOP20]
-
     except Exception as e:
         log.warning("[COINS LIST %s] %s", exchange, e)
-
     return [{"sym": s, "name": COIN_NAMES.get(s, s), "vol": 0, "chg": 0.0} for s in TOP20]
-
 
 # ── PRICE WATCHER ─────────────────────────────────────────────────────────────
 
@@ -440,11 +478,11 @@ async def price_watcher():
             data = rows.data or []
             log.info("[WATCHER] Проверяем %d записей", len(data))
             for row in data:
-                sym      = row.get("symbol", "")
+                sym = row.get("symbol", "")
                 exchange = row.get("exchange", "binance")
-                tg_id    = row.get("tg_id")
-                old_px   = safe_float(row.get("last_price") or row.get("price_at_add"))
-                alert_pct= safe_float(row.get("alert_pct"), 5.0)
+                tg_id = row.get("tg_id")
+                old_px = safe_float(row.get("last_price") or row.get("price_at_add"))
+                alert_pct = safe_float(row.get("alert_pct"), 5.0)
 
                 if not sym or not tg_id or old_px <= 0:
                     continue
@@ -461,11 +499,11 @@ async def price_watcher():
 
                 change_pct = (new_px - old_px) / old_px * 100
 
-                # Уведомляем при ЛЮБОМ изменении >= alert_pct (вверх или вниз)
+                # Отправляем уведомление, если изменение >= alert_pct
                 if abs(change_pct) >= alert_pct:
                     direction = "📈 выросла" if change_pct > 0 else "📉 упала"
-                    sign      = "\\+" if change_pct > 0 else "\\-"
-                    label     = sym if "/" in sym else f"{sym} \\({exchange.upper()}\\)"
+                    sign = "\\+" if change_pct > 0 else "\\-"
+                    label = sym if "/" in sym else f"{sym} \\({exchange.upper()}\\)"
                     old_f = escape_md2(fmt_price(old_px))
                     new_f = escape_md2(fmt_price(new_px))
                     msg = (
@@ -481,11 +519,13 @@ async def price_watcher():
                             log.info("[ALERT] %s → %s %.2f%%", sym, tg_id, change_pct)
                         except Exception as te:
                             log.warning("[ALERT TG] %s", te)
+                    # Обновляем цену и время
                     supabase.table("crypto_monitors").update({
                         "last_price": new_px,
                         "last_alerted": datetime.now(timezone.utc).isoformat(),
                     }).eq("id", row["id"]).execute()
                 else:
+                    # Обновляем только цену
                     supabase.table("crypto_monitors").update({"last_price": new_px}).eq("id", row["id"]).execute()
 
                 await asyncio.sleep(0.5)
@@ -493,8 +533,7 @@ async def price_watcher():
             log.error("[WATCHER FATAL] %s", fatal)
         await asyncio.sleep(300)
 
-
-# ── BOT ───────────────────────────────────────────────────────────────────────
+# ── Бот ───────────────────────────────────────────────────────────────────────
 
 async def run_bot_polling():
     if not bot:
@@ -561,8 +600,7 @@ async def handle_message(message: types.Message):
     except Exception as e:
         await message.answer(f"⚠️ Ошибка: {e}")
 
-
-# ── STARTUP ───────────────────────────────────────────────────────────────────
+# ── STARTUP ─────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup_event():
@@ -571,8 +609,13 @@ async def startup_event():
     asyncio.create_task(run_bot_polling())
     log.info("[STARTUP] OK")
 
+# ── SHUTDOWN ────────────────────────────────────────────────────────────────
 
-# ── ROUTES ────────────────────────────────────────────────────────────────────
+@app.on_event("shutdown")
+async def shutdown_event():
+    await HTTP_CLIENT.aclose()
+
+# ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
@@ -591,24 +634,29 @@ async def auth(request: Request):
         ip = get_client_ip(request)
         existing = supabase.table("users").select("id,visit_count").eq("tg_id", tg_id).execute()
         if existing.data:
-            cnt = existing.data[0].get("visit_count") or 1
+            cnt = existing.data[0].get("visit_count") or 0
             supabase.table("users").update({
                 "last_ip": ip, "last_seen": now_iso,
-                "user_agent": request.headers.get("user-agent",""),
+                "user_agent": request.headers.get("user-agent", ""),
                 "platform": str(data.get("platform") or ""),
                 "language": str(data.get("language") or ""),
                 "visit_count": cnt + 1,
             }).eq("tg_id", tg_id).execute()
             return {"status": "ok", "already_registered": True}
+        # Новая регистрация
         supabase.table("users").insert({
-            "tg_id": tg_id, "username": str(data.get("username") or ""),
+            "tg_id": tg_id,
+            "username": str(data.get("username") or ""),
             "first_name": str(data.get("first_name") or ""),
             "last_name": str(data.get("last_name") or ""),
-            "reg_ip": ip, "last_ip": ip,
-            "user_agent": request.headers.get("user-agent",""),
+            "reg_ip": ip,
+            "last_ip": ip,
+            "user_agent": request.headers.get("user-agent", ""),
             "platform": str(data.get("platform") or ""),
             "language": str(data.get("language") or ""),
-            "last_seen": now_iso, "created_at": now_iso, "visit_count": 1,
+            "last_seen": now_iso,
+            "created_at": now_iso,
+            "visit_count": 1,
         }).execute()
         return {"status": "ok", "already_registered": False}
     except Exception as e:
@@ -618,31 +666,37 @@ async def auth(request: Request):
 @app.post("/analyze")
 async def analyze_route(request: Request):
     try:
-        data      = await request.json()
-        symbol    = str(data.get("symbol") or "").strip().upper()
-        exchange  = str(data.get("exchange") or "binance").strip().lower()
-        tg_id     = data.get("id")
+        data = await request.json()
+        symbol = str(data.get("symbol") or "").strip().upper()
+        exchange = str(data.get("exchange") or "binance").strip().lower()
+        tg_id = data.get("id")
         alert_pct = safe_float(data.get("alert_pct"), 5.0)
         if not symbol:
             return JSONResponse({"status": "error", "message": "Укажите символ"}, status_code=400)
         live_price = await fetch_crypto_price(symbol, exchange)
-        result     = await analyze_crypto(symbol, exchange, live_price)
-        final_px   = live_price or result.get("current_price_usd") or 0
+        result = await analyze_crypto(symbol, exchange, live_price)
+        final_px = live_price or result.get("current_price_usd") or 0
         if supabase and tg_id:
             try:
-                now_iso  = datetime.now(timezone.utc).isoformat()
+                now_iso = datetime.now(timezone.utc).isoformat()
                 existing = supabase.table("crypto_monitors").select("id") \
                     .eq("tg_id", tg_id).eq("symbol", symbol).eq("exchange", exchange).execute()
                 if existing.data:
                     supabase.table("crypto_monitors").update({
-                        "last_price": final_px, "price_at_add": final_px,
-                        "alert_pct": alert_pct, "added_at": now_iso,
+                        "last_price": final_px,
+                        "price_at_add": final_px,
+                        "alert_pct": alert_pct,
+                        "added_at": now_iso,
                     }).eq("id", existing.data[0]["id"]).execute()
                 else:
                     supabase.table("crypto_monitors").insert({
-                        "tg_id": tg_id, "symbol": symbol, "exchange": exchange,
-                        "price_at_add": final_px, "last_price": final_px,
-                        "alert_pct": alert_pct, "added_at": now_iso,
+                        "tg_id": tg_id,
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "price_at_add": final_px,
+                        "last_price": final_px,
+                        "alert_pct": alert_pct,
+                        "added_at": now_iso,
                     }).execute()
             except Exception as db_err:
                 log.warning("[DB ANALYZE] %s", db_err)
@@ -654,32 +708,38 @@ async def analyze_route(request: Request):
 @app.post("/analyze-forex")
 async def analyze_forex_route(request: Request):
     try:
-        data      = await request.json()
-        base      = str(data.get("base") or "").strip().upper()
-        quote     = str(data.get("quote") or "USD").strip().upper()
-        tg_id     = data.get("id")
+        data = await request.json()
+        base = str(data.get("base") or "").strip().upper()
+        quote = str(data.get("quote") or "USD").strip().upper()
+        tg_id = data.get("id")
         alert_pct = safe_float(data.get("alert_pct"), 1.0)
         if not base:
             return JSONResponse({"status": "error", "message": "Укажите валюту"}, status_code=400)
         live_rate = await fetch_forex_rate(base, quote)
-        result    = await analyze_forex(base, quote, live_rate)
-        final_r   = live_rate or result.get("current_rate") or 0
+        result = await analyze_forex(base, quote, live_rate)
+        final_r = live_rate or result.get("current_rate") or 0
         if supabase and tg_id:
             try:
-                now_iso  = datetime.now(timezone.utc).isoformat()
+                now_iso = datetime.now(timezone.utc).isoformat()
                 pair_sym = f"{base}/{quote}"
                 existing = supabase.table("crypto_monitors").select("id") \
                     .eq("tg_id", tg_id).eq("symbol", pair_sym).execute()
                 if existing.data:
                     supabase.table("crypto_monitors").update({
-                        "last_price": final_r, "price_at_add": final_r,
-                        "alert_pct": alert_pct, "added_at": now_iso,
+                        "last_price": final_r,
+                        "last_alerted": now_iso,
+                        "alert_pct": alert_pct,
+                        "added_at": now_iso,
                     }).eq("id", existing.data[0]["id"]).execute()
                 else:
                     supabase.table("crypto_monitors").insert({
-                        "tg_id": tg_id, "symbol": pair_sym, "exchange": "forex",
-                        "price_at_add": final_r, "last_price": final_r,
-                        "alert_pct": alert_pct, "added_at": now_iso,
+                        "tg_id": tg_id,
+                        "symbol": pair_sym,
+                        "exchange": "forex",
+                        "price_at_add": final_r,
+                        "last_price": final_r,
+                        "alert_pct": alert_pct,
+                        "added_at": now_iso,
                     }).execute()
             except Exception as db_err:
                 log.warning("[DB FOREX] %s", db_err)
@@ -697,7 +757,7 @@ async def get_coins(exchange: str):
 async def get_price(exchange: str, symbol: str):
     price = await fetch_crypto_price(symbol.upper(), exchange.lower())
     if price is None:
-        return JSONResponse({"status": "error", "message": f"Нет данных"}, status_code=404)
+        return JSONResponse({"status": "error", "message": "Нет данных"}, status_code=404)
     return {"status": "ok", "price": price, "symbol": symbol.upper(), "exchange": exchange}
 
 @app.get("/forex/{base}/{quote}")
@@ -709,9 +769,8 @@ async def get_forex(base: str, quote: str = "USD"):
 
 @app.get("/admin/user/{username}")
 async def admin_get_user(username: str, request: Request):
-    # Простая защита через query param для REST
     key = request.query_params.get("key", "")
-    if key != str(ADMIN_TG_ID):
+    if key != ADMIN_SECRET:
         return JSONResponse({"status": "error"}, status_code=403)
     if not supabase:
         return JSONResponse({"status": "error", "message": "No DB"}, status_code=500)
@@ -722,5 +781,6 @@ async def admin_get_user(username: str, request: Request):
     monitors = supabase.table("crypto_monitors").select("*").eq("tg_id", u["tg_id"]).execute()
     return {"status": "ok", "user": u, "monitors": monitors.data or []}
 
+# Запуск сервиса
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=False)
