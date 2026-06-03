@@ -64,7 +64,6 @@ def safe_float(val, default: float = 0.0) -> float:
 
 
 def _parse_json_safe(raw: str) -> Optional[dict]:
-    """Вырезает первый валидный JSON-объект из строки."""
     raw = re.sub(r"```(?:json)?", "", raw).strip("`").strip()
     s = raw.find("{")
     e = raw.rfind("}") + 1
@@ -73,7 +72,6 @@ def _parse_json_safe(raw: str) -> Optional[dict]:
     try:
         return json.loads(raw[s:e])
     except json.JSONDecodeError:
-        # Попытка починить обрезанный JSON
         try:
             return json.loads(raw[s:e].rsplit(",", 1)[0] + "}")
         except Exception:
@@ -93,13 +91,12 @@ async def keep_alive():
             await asyncio.sleep(280)
 
 
-# ── PRICE FETCHING ────────────────────────────────────────────────────────────
+# ── CRYPTO PRICE FETCHING ─────────────────────────────────────────────────────
 
-async def fetch_price_from_exchange(symbol: str, exchange: str) -> Optional[float]:
+async def fetch_crypto_price(symbol: str, exchange: str) -> Optional[float]:
     sym = symbol.upper().strip()
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-
             if exchange == "binance":
                 for quote in ("USDT", "BUSD", "USDC"):
                     try:
@@ -171,7 +168,72 @@ async def fetch_price_from_exchange(symbol: str, exchange: str) -> Optional[floa
                 return None
 
     except Exception as e:
-        log.warning("[PRICE %s/%s] %s", exchange, sym, e)
+        log.warning("[CRYPTO PRICE %s/%s] %s", exchange, sym, e)
+        return None
+
+
+# ── FOREX PRICE FETCHING ──────────────────────────────────────────────────────
+
+FOREX_PAIRS = {
+    "USD": "Доллар США",
+    "EUR": "Евро",
+    "GBP": "Британский фунт",
+    "JPY": "Японская иена",
+    "CHF": "Швейцарский франк",
+    "CNY": "Китайский юань",
+    "CAD": "Канадский доллар",
+    "AUD": "Австралийский доллар",
+    "UAH": "Украинская гривна",
+    "RUB": "Российский рубль",
+    "TRY": "Турецкая лира",
+    "BRL": "Бразильский реал",
+    "INR": "Индийская рупия",
+    "MXN": "Мексиканское песо",
+    "PLN": "Польский злотый",
+    "SEK": "Шведская крона",
+    "NOK": "Норвежская крона",
+    "DKK": "Датская крона",
+    "SGD": "Сингапурский доллар",
+    "HKD": "Гонконгский доллар",
+    "NZD": "Новозеландский доллар",
+    "KZT": "Казахстанский тенге",
+    "GEL": "Грузинский лари",
+    "AED": "Дирхам ОАЭ",
+    "SAR": "Саудовский риял",
+}
+
+async def fetch_forex_rate(base: str, quote: str = "USD") -> Optional[float]:
+    """Получить курс base/quote (сколько quote за 1 base)."""
+    base  = base.upper().strip()
+    quote = quote.upper().strip()
+    if base == quote:
+        return 1.0
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            # Источник 1: exchangerate-api (open endpoint)
+            try:
+                r = await c.get(f"https://open.er-api.com/v6/latest/{base}")
+                d = r.json()
+                if d.get("result") == "success":
+                    rate = safe_float(d.get("rates", {}).get(quote))
+                    if rate > 0:
+                        return rate
+            except Exception:
+                pass
+
+            # Источник 2: frankfurter.app
+            try:
+                r = await c.get("https://api.frankfurter.app/latest", params={"from": base, "to": quote})
+                d = r.json()
+                rate = safe_float(d.get("rates", {}).get(quote))
+                if rate > 0:
+                    return rate
+            except Exception:
+                pass
+
+            return None
+    except Exception as e:
+        log.warning("[FOREX %s/%s] %s", base, quote, e)
         return None
 
 
@@ -193,7 +255,7 @@ FALLBACK_PRICES = {
 }
 
 
-# ── AI ANALYSIS ───────────────────────────────────────────────────────────────
+# ── AI CRYPTO ANALYSIS ────────────────────────────────────────────────────────
 
 async def analyze_crypto(symbol: str, exchange: str, live_price: Optional[float]) -> dict:
     sym  = symbol.upper()
@@ -205,15 +267,13 @@ async def analyze_crypto(symbol: str, exchange: str, live_price: Optional[float]
     p_rub = round(p * 92,   4)
     p_str = f"${p:,.2f}" if p >= 1 else f"${p:.6f}"
 
-    # ── Строим реалистичную 7-дневную историю для примера ──
+    import random
     history_hint = []
     days = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
-    import random, math
-    seed_price = p
     for i, day in enumerate(days):
-        noise = seed_price * (0.97 + random.random() * 0.06)
+        noise = p * (0.97 + random.random() * 0.06)
         history_hint.append({"day": day, "price": round(noise, 6)})
-    history_hint[-1]["price"] = p  # Последний день = текущая цена
+    history_hint[-1]["price"] = p
 
     prompt = f"""Ты профессиональный криптоаналитик. Дай детальный анализ {name} ({sym}).
 Текущая живая цена с биржи {exchange.upper()}: {p_str}
@@ -272,16 +332,12 @@ async def analyze_crypto(symbol: str, exchange: str, live_price: Optional[float]
 - current_price_usd ВСЕГДА равен {p} — не меняй
 - ТОЛЬКО JSON"""
 
-    # ── Если ИИ не настроен — сразу fallback ──
     if not ai:
-        log.warning("[AI] OpenAI не настроен, используем fallback")
         return _fallback_crypto(sym, name, exchange, live_price)
 
-    # ── Попытка 1: gpt-4o-mini ──
     for attempt in range(2):
         model = "gpt-4o-mini" if attempt == 0 else "gpt-3.5-turbo"
         try:
-            log.info("[AI] Запрос к %s для %s/%s", model, sym, exchange)
             resp = await ai.chat.completions.create(
                 model=model,
                 messages=[
@@ -296,10 +352,8 @@ async def analyze_crypto(symbol: str, exchange: str, live_price: Optional[float]
             result = _parse_json_safe(raw)
 
             if result is None:
-                log.error("[AI %s] Невалидный JSON: %s...", model, raw[:200])
-                continue  # Попробуем второй attempt
+                continue
 
-            # Всегда подставляем живую цену — ИИ не должен её переопределять
             if live_price and live_price > 0:
                 result["current_price_usd"] = live_price
                 result["price_uah"] = round(live_price * 41,   4)
@@ -307,8 +361,6 @@ async def analyze_crypto(symbol: str, exchange: str, live_price: Optional[float]
                 result["price_rub"] = round(live_price * 92,   4)
 
             result["exchange"] = exchange
-
-            # Гарантируем что нужные поля есть
             result.setdefault("price_history_7d", history_hint)
             result.setdefault("forecast",    {})
             result.setdefault("ai_analysis", {})
@@ -316,7 +368,6 @@ async def analyze_crypto(symbol: str, exchange: str, live_price: Optional[float]
             result.setdefault("change_24h",  0.0)
             result.setdefault("change_7d",   0.0)
 
-            # Гарантируем вложенные поля forecast
             fc = result["forecast"]
             fc.setdefault("predicted_7d",  round(p * 1.03, 6))
             fc.setdefault("predicted_30d", round(p * 1.08, 6))
@@ -325,7 +376,6 @@ async def analyze_crypto(symbol: str, exchange: str, live_price: Optional[float]
             fc.setdefault("support",       round(p * 0.92, 6))
             fc.setdefault("resistance",    round(p * 1.10, 6))
 
-            # Гарантируем вложенные поля ai_analysis
             an = result["ai_analysis"]
             an.setdefault("summary",        "Анализ выполнен.")
             an.setdefault("risks",          "Волатильность рынка.")
@@ -333,22 +383,18 @@ async def analyze_crypto(symbol: str, exchange: str, live_price: Optional[float]
             an.setdefault("recommendation", "держать")
             an.setdefault("sentiment",      "нейтральный")
 
-            # Гарантируем вложенные поля metrics
             mt = result["metrics"]
             mt.setdefault("volatility",         "средняя")
             mt.setdefault("liquidity",          "высокая")
             mt.setdefault("tech_score",         60)
             mt.setdefault("fundamental_score",  60)
 
-            log.info("[AI OK] %s %s $%s (модель: %s)", sym, exchange, result.get("current_price_usd"), model)
             return result
 
         except Exception as e:
             log.error("[AI %s attempt %d] %s", model, attempt, e)
             continue
 
-    # ── Все попытки провалились ──
-    log.warning("[AI] Все попытки провалились, используем fallback для %s", sym)
     return _fallback_crypto(sym, name, exchange, live_price)
 
 
@@ -398,6 +444,148 @@ def _fallback_crypto(sym: str, name: str, exchange: str, price: Optional[float])
     }
 
 
+# ── AI FOREX ANALYSIS ─────────────────────────────────────────────────────────
+
+async def analyze_forex(base: str, quote: str, live_rate: Optional[float]) -> dict:
+    base_name  = FOREX_PAIRS.get(base.upper(),  base.upper())
+    quote_name = FOREX_PAIRS.get(quote.upper(), quote.upper())
+    rate = live_rate if (live_rate and live_rate > 0) else 1.0
+    rate_str = f"{rate:.4f}"
+
+    import random
+    history_hint = []
+    days = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
+    for day in days:
+        noise = rate * (0.985 + random.random() * 0.03)
+        history_hint.append({"day": day, "rate": round(noise, 6)})
+    history_hint[-1]["rate"] = rate
+
+    prompt = f"""Ты профессиональный валютный аналитик. Дай детальный анализ пары {base}/{quote}.
+Текущий курс: 1 {base} = {rate_str} {quote}
+
+Верни СТРОГО валидный JSON:
+{{
+  "base": "{base}",
+  "quote": "{quote}",
+  "base_name": "{base_name}",
+  "quote_name": "{quote_name}",
+  "description": "3-4 информативных предложения об этой валютной паре",
+  "current_rate": {rate},
+  "rate_history_7d": [
+    {{"day":"Пн","rate":{history_hint[0]["rate"]}}},
+    {{"day":"Вт","rate":{history_hint[1]["rate"]}}},
+    {{"day":"Ср","rate":{history_hint[2]["rate"]}}},
+    {{"day":"Чт","rate":{history_hint[3]["rate"]}}},
+    {{"day":"Пт","rate":{history_hint[4]["rate"]}}},
+    {{"day":"Сб","rate":{history_hint[5]["rate"]}}},
+    {{"day":"Вс","rate":{history_hint[6]["rate"]}}}
+  ],
+  "change_24h": <число процентов>,
+  "change_7d": <число процентов>,
+  "forecast": {{
+    "predicted_7d": <число>,
+    "predicted_30d": <число>,
+    "trend": "bullish",
+    "confidence": <число 40-85>
+  }},
+  "ai_analysis": {{
+    "summary": "2-3 предложения конкретного анализа текущей ситуации",
+    "factors": "основные факторы влияющие на курс",
+    "recommendation": "держать",
+    "sentiment": "нейтральный"
+  }}
+}}
+
+Правила:
+- trend: строго одно из bullish | bearish | sideways
+- recommendation: строго одно из купить | держать | продать | накапливать
+- sentiment: строго одно из позитивный | нейтральный | негативный | осторожный
+- current_rate ВСЕГДА равен {rate} — не меняй
+- ТОЛЬКО JSON"""
+
+    if not ai:
+        return _fallback_forex(base, quote, base_name, quote_name, live_rate)
+
+    for attempt in range(2):
+        model = "gpt-4o-mini" if attempt == 0 else "gpt-3.5-turbo"
+        try:
+            resp = await ai.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "Ты валютный аналитик. Отвечаешь ТОЛЬКО валидным JSON без markdown."},
+                    {"role": "user",   "content": prompt},
+                ],
+                temperature=0.25,
+                max_tokens=1200,
+                timeout=30,
+            )
+            raw    = resp.choices[0].message.content or ""
+            result = _parse_json_safe(raw)
+            if result is None:
+                continue
+
+            if live_rate and live_rate > 0:
+                result["current_rate"] = live_rate
+
+            result.setdefault("rate_history_7d", history_hint)
+            result.setdefault("forecast",    {})
+            result.setdefault("ai_analysis", {})
+            result.setdefault("change_24h",  0.0)
+            result.setdefault("change_7d",   0.0)
+
+            fc = result["forecast"]
+            fc.setdefault("predicted_7d",  round(rate * 1.01, 6))
+            fc.setdefault("predicted_30d", round(rate * 1.02, 6))
+            fc.setdefault("trend",         "sideways")
+            fc.setdefault("confidence",    55)
+
+            an = result["ai_analysis"]
+            an.setdefault("summary",        "Анализ выполнен.")
+            an.setdefault("factors",        "Макроэкономические показатели.")
+            an.setdefault("recommendation", "держать")
+            an.setdefault("sentiment",      "нейтральный")
+
+            return result
+
+        except Exception as e:
+            log.error("[FOREX AI %s attempt %d] %s", model, attempt, e)
+            continue
+
+    return _fallback_forex(base, quote, base_name, quote_name, live_rate)
+
+
+def _fallback_forex(base: str, quote: str, base_name: str, quote_name: str, rate: Optional[float]) -> dict:
+    r = rate if (rate and rate > 0) else 1.0
+    return {
+        "base": base, "quote": quote,
+        "base_name": base_name, "quote_name": quote_name,
+        "description": f"Валютная пара {base}/{quote}. ИИ-анализ временно недоступен.",
+        "current_rate": r,
+        "rate_history_7d": [
+            {"day": "Пн", "rate": round(r * 0.99, 6)},
+            {"day": "Вт", "rate": round(r * 0.995, 6)},
+            {"day": "Ср", "rate": round(r * 1.002, 6)},
+            {"day": "Чт", "rate": round(r * 0.998, 6)},
+            {"day": "Пт", "rate": round(r * 1.001, 6)},
+            {"day": "Сб", "rate": round(r * 1.003, 6)},
+            {"day": "Вс", "rate": round(r, 6)},
+        ],
+        "change_24h": 0.0, "change_7d": 0.0,
+        "forecast": {
+            "predicted_7d":  round(r * 1.01, 6),
+            "predicted_30d": round(r * 1.02, 6),
+            "trend":         "sideways",
+            "confidence":    50,
+        },
+        "ai_analysis": {
+            "summary":        "ИИ-анализ временно недоступен.",
+            "factors":        "Макроэкономические показатели.",
+            "recommendation": "держать",
+            "sentiment":      "нейтральный",
+        },
+    }
+
+
 # ── PRICE WATCHER ─────────────────────────────────────────────────────────────
 
 async def price_watcher():
@@ -417,21 +605,33 @@ async def price_watcher():
                 tg_id     = row.get("tg_id")
                 old_px    = safe_float(row.get("last_price") or row.get("price_at_add"))
                 alert_pct = safe_float(row.get("alert_pct"), 5.0)
+                monitor_type = row.get("monitor_type", "crypto")
+
                 if not sym or not tg_id or old_px <= 0:
                     continue
-                new_px = await fetch_price_from_exchange(sym, exchange)
+
+                if monitor_type == "forex":
+                    # sym формат: "EUR/USD"
+                    parts = sym.split("/")
+                    if len(parts) != 2:
+                        continue
+                    new_px = await fetch_forex_rate(parts[0], parts[1])
+                else:
+                    new_px = await fetch_crypto_price(sym, exchange)
+
                 if not new_px or new_px <= 0:
                     continue
+
                 change_pct = ((new_px - old_px) / old_px) * 100
                 if abs(change_pct) >= alert_pct:
                     direction = "📈 выросла" if change_pct > 0 else "📉 упала"
                     sign      = "\\+" if change_pct > 0 else "\\-"
-                    old_fmt   = escape_md2(f"${old_px:,.2f}" if old_px >= 1 else f"${old_px:.6f}")
-                    new_fmt   = escape_md2(f"${new_px:,.2f}" if new_px >= 1 else f"${new_px:.6f}")
+                    old_fmt   = escape_md2(f"${old_px:,.4f}" if monitor_type == "forex" else (f"${old_px:,.2f}" if old_px >= 1 else f"${old_px:.6f}"))
+                    new_fmt   = escape_md2(f"${new_px:,.4f}" if monitor_type == "forex" else (f"${new_px:,.2f}" if new_px >= 1 else f"${new_px:.6f}"))
+                    label     = sym if monitor_type == "forex" else f"{sym} ({exchange.upper()})"
                     msg = (
-                        f"🔔 *{escape_md2(sym)}* {direction} на "
+                        f"🔔 *{escape_md2(label)}* {direction} на "
                         f"*{sign}{escape_md2(str(round(abs(change_pct), 2)))}%*\n"
-                        f"Биржа: `{escape_md2(exchange.upper())}`\n"
                         f"Было: `{old_fmt}`\n"
                         f"Сейчас: `{new_fmt}`\n"
                         f"_Crypto Space_"
@@ -494,7 +694,7 @@ async def cmd_start(message: types.Message):
         )
     ]])
     await message.answer(
-        "👋 Привет\\! *Crypto Space* — мониторинг крипты с ИИ\\-аналитикой\\.\n\nНажми кнопку ниже 👇",
+        "👋 Привет\\! *Crypto Space* — мониторинг крипты и валюты с ИИ\\-аналитикой\\.\n\nНажми кнопку ниже 👇",
         reply_markup=kb, parse_mode="MarkdownV2"
     )
 
@@ -503,7 +703,7 @@ async def cmd_start(message: types.Message):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "Crypto Space", "version": "2.1"}
+    return {"status": "ok", "service": "Crypto Space", "version": "3.0"}
 
 
 @app.post("/auth")
@@ -563,26 +763,19 @@ async def auth(request: Request):
 @app.post("/analyze")
 async def analyze(request: Request):
     try:
-        data       = await request.json()
-        symbol     = str(data.get("symbol")   or "").strip().upper()
-        exchange   = str(data.get("exchange") or "binance").strip().lower()
-        tg_id      = data.get("id")
-        alert_pct  = safe_float(data.get("alert_pct"), 5.0)
+        data      = await request.json()
+        symbol    = str(data.get("symbol")   or "").strip().upper()
+        exchange  = str(data.get("exchange") or "binance").strip().lower()
+        tg_id     = data.get("id")
+        alert_pct = safe_float(data.get("alert_pct"), 5.0)
 
         if not symbol:
             return JSONResponse({"status": "error", "message": "Укажите символ"}, status_code=400)
 
-        log.info("[ANALYZE] %s/%s tg_id=%s", symbol, exchange, tg_id)
+        live_price = await fetch_crypto_price(symbol, exchange)
+        result     = await analyze_crypto(symbol, exchange, live_price)
+        final_px   = live_price or result.get("current_price_usd") or 0
 
-        # 1. Получаем живую цену
-        live_price = await fetch_price_from_exchange(symbol, exchange)
-        log.info("[ANALYZE] Живая цена %s/%s = %s", symbol, exchange, live_price)
-
-        # 2. ИИ-анализ (с fallback внутри)
-        result   = await analyze_crypto(symbol, exchange, live_price)
-        final_px = live_price or result.get("current_price_usd") or 0
-
-        # 3. Сохраняем в БД
         if supabase and tg_id:
             try:
                 now_iso  = datetime.now(timezone.utc).isoformat()
@@ -591,13 +784,13 @@ async def analyze(request: Request):
                 if existing.data:
                     supabase.table("crypto_monitors").update({
                         "last_price": final_px, "price_at_add": final_px,
-                        "alert_pct": alert_pct,  "added_at": now_iso,
+                        "alert_pct": alert_pct, "added_at": now_iso, "monitor_type": "crypto",
                     }).eq("id", existing.data[0]["id"]).execute()
                 else:
                     supabase.table("crypto_monitors").insert({
                         "tg_id": tg_id, "symbol": symbol, "exchange": exchange,
                         "price_at_add": final_px, "last_price": final_px,
-                        "alert_pct": alert_pct,   "added_at": now_iso,
+                        "alert_pct": alert_pct, "added_at": now_iso, "monitor_type": "crypto",
                     }).execute()
             except Exception as db_err:
                 log.warning("[DB ANALYZE] %s", db_err)
@@ -609,12 +802,63 @@ async def analyze(request: Request):
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
+@app.post("/analyze-forex")
+async def analyze_forex_route(request: Request):
+    try:
+        data      = await request.json()
+        base      = str(data.get("base")  or "").strip().upper()
+        quote     = str(data.get("quote") or "USD").strip().upper()
+        tg_id     = data.get("id")
+        alert_pct = safe_float(data.get("alert_pct"), 1.0)
+
+        if not base:
+            return JSONResponse({"status": "error", "message": "Укажите валюту"}, status_code=400)
+
+        live_rate = await fetch_forex_rate(base, quote)
+        result    = await analyze_forex(base, quote, live_rate)
+        final_r   = live_rate or result.get("current_rate") or 0
+
+        if supabase and tg_id:
+            try:
+                now_iso  = datetime.now(timezone.utc).isoformat()
+                pair_sym = f"{base}/{quote}"
+                existing = supabase.table("crypto_monitors").select("id") \
+                    .eq("tg_id", tg_id).eq("symbol", pair_sym).execute()
+                if existing.data:
+                    supabase.table("crypto_monitors").update({
+                        "last_price": final_r, "price_at_add": final_r,
+                        "alert_pct": alert_pct, "added_at": now_iso, "monitor_type": "forex",
+                    }).eq("id", existing.data[0]["id"]).execute()
+                else:
+                    supabase.table("crypto_monitors").insert({
+                        "tg_id": tg_id, "symbol": pair_sym, "exchange": "forex",
+                        "price_at_add": final_r, "last_price": final_r,
+                        "alert_pct": alert_pct, "added_at": now_iso, "monitor_type": "forex",
+                    }).execute()
+            except Exception as db_err:
+                log.warning("[DB FOREX] %s", db_err)
+
+        return {"status": "ok", "data": result}
+
+    except Exception as e:
+        log.error("[FOREX ANALYZE ERROR] %s", e)
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
 @app.get("/price/{exchange}/{symbol}")
 async def get_price(exchange: str, symbol: str):
-    price = await fetch_price_from_exchange(symbol.upper(), exchange.lower())
+    price = await fetch_crypto_price(symbol.upper(), exchange.lower())
     if price is None:
         return JSONResponse({"status": "error", "message": f"Не удалось получить цену {symbol} с {exchange}"}, status_code=404)
     return {"status": "ok", "price": price, "symbol": symbol.upper(), "exchange": exchange.lower()}
+
+
+@app.get("/forex/{base}/{quote}")
+async def get_forex(base: str, quote: str = "USD"):
+    rate = await fetch_forex_rate(base.upper(), quote.upper())
+    if rate is None:
+        return JSONResponse({"status": "error", "message": f"Не удалось получить курс {base}/{quote}"}, status_code=404)
+    return {"status": "ok", "rate": rate, "base": base.upper(), "quote": quote.upper()}
 
 
 @app.get("/monitors/{tg_id}")
