@@ -581,11 +581,13 @@ async def handle_message(message: types.Message):
         u = res.data[0]
         monitors = supabase.table("crypto_monitors").select("*").eq("tg_id", u["tg_id"]).execute()
         mon_list = monitors.data or []
-        mon_text = "\n".join([f"  • {m['symbol']} ({m.get('exchange','')}) — alert {m.get('alert_pct')}%" for m in mon_list]) or "  нет мониторингов"
+
+        full_name = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
+
         text = (
             f"👤 *@{escape_md2(username)}*\n"
             f"ID: `{u['tg_id']}`\n"
-            f"Имя: {escape_md2(f\"{u.get('first_name','')} {u.get('last_name','')}\".strip())}\n"
+            f"Имя: {escape_md2(full_name)}\n"
             f"IP рег: `{escape_md2(u.get('reg_ip',''))}`\n"
             f"Последний IP: `{escape_md2(u.get('last_ip',''))}`\n"
             f"Платформа: {escape_md2(u.get('platform',''))}\n"
