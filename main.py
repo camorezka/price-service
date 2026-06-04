@@ -785,23 +785,84 @@ async def admin_get_user(username: str, request: Request):
 
 
 @app.post("/activate-monitor")
-async def activate_monitor(data: dict):
-    tg_id = data.get("tg_id")
-    symbol = data.get("symbol")
-    
-    monitor = supabase.table("crypto_monitors").select("*").eq("tg_id", tg_id).eq("symbol", symbol).execute()
-    if monitor.data:
-        m = monitor.data[0]
-        if m['alerts_count'] >= 3:
-            return {"status": "error", "message": "Лимит на 7 дней исчерпан"}
-        
-        supabase.table("crypto_monitors").update({
-            "alerts_count": m['alerts_count'] + 1,
-            "last_alerted": datetime.now(timezone.utc).isoformat()
-        }).eq("id", m['id']).execute()
-        
-    return {"status": "ok"}
+async def activate_monitor(request: Request):
+    try:
+        data = await request.json()
+        tg_id = data.get("tg_id")
+        symbol = str(data.get("symbol") or "").strip().upper()
+        exchange = str(data.get("exchange") or "").strip().lower()
+        if not tg_id or not symbol or not exchange:
+            return JSONResponse({"status": "error", "message": "Не хватает параметров"}, status_code=400)
+        if not supabase:
+            return JSONResponse({"status": "error", "message": "DB не настроена"}, status_code=500)
 
+        now = datetime.now(timezone.utc)
+
+        # Проверяем запись
+        existing = supabase.table("crypto_monitors").select("*") \
+            .eq("tg_id", tg_id).eq("symbol", symbol).eq("exchange", exchange).execute()
+
+        if existing.data:
+            m = existing.data[0]
+            # Если прошло 7 дней — сбрасываем счётчик
+            expires_at = m.get("expires_at")
+            if expires_at:
+                from dateutil.parser import parse as parse_dt
+                exp = parse_dt(expires_at)
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if now > exp:
+                    # Сброс — новая неделя
+                    supabase.table("crypto_monitors").update({
+                        "alerts_count": 1,
+                        "expires_at": (now + __import__('datetime').timedelta(days=7)).isoformat(),
+                        "last_alerted": now.isoformat(),
+                        "price_at_add": m.get("last_price", 0),
+                    }).eq("id", m["id"]).execute()
+                    return {"status": "ok", "remaining": 2}
+
+            count = m.get("alerts_count") or 0
+            if count >= 3:
+                return {"status": "error", "message": "Лимит исчерпан — 3 запуска в неделю"}
+
+            new_count = count + 1
+            supabase.table("crypto_monitors").update({
+                "alerts_count": new_count,
+                "last_alerted": now.isoformat(),
+            }).eq("id", m["id"]).execute()
+            return {"status": "ok", "remaining": 3 - new_count}
+        else:
+            # Новая запись
+            from datetime import timedelta
+            supabase.table("crypto_monitors").insert({
+                "tg_id": tg_id,
+                "symbol": symbol,
+                "exchange": exchange,
+                "alerts_count": 1,
+                "expires_at": (now + timedelta(days=7)).isoformat(),
+                "last_alerted": now.isoformat(),
+                "price_at_add": 0,
+                "last_price": 0,
+                "alert_pct": 5,
+            }).execute()
+            return {"status": "ok", "remaining": 2}
+    except Exception as e:
+        log.error("[ACTIVATE-MONITOR] %s", e)
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.get("/check-sub")
+async def check_sub(tg_id: int):
+    """Проверка подписки на канал @MonitorSpace"""
+    if not bot:
+        return {"subscribed": True}
+    try:
+        member = await bot.get_chat_member(chat_id="@MonitorSpace", user_id=tg_id)
+        subscribed = member.status not in ("left", "kicked", "banned")
+        return {"subscribed": subscribed}
+    except Exception as e:
+        log.warning("[CHECK-SUB] %s", e)
+        return {"subscribed": True}  # при ошибке пускаем
 
 
 
