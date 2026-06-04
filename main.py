@@ -97,12 +97,17 @@ async def fetch_crypto_price(symbol: str, exchange: str):
         if exchange == "binance":
             for q in ("USDT", "USDC", "BUSD"):
                 try:
-                    r = await HTTP_CLIENT.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": sym + q})
-                    r.raise_for_status()
-                    px = safe_float(r.json().get("price"))
-                    if px > 0:
-                        return px
-                except:
+                    pair = sym + q
+                    r = await HTTP_CLIENT.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": pair})
+                    
+                    if r.status_code == 200:
+                        px = safe_float(r.json().get("price"))
+                        if px > 0:
+                            return px
+                    else:
+                        log.warning(f"[BINANCE] Ошибка для {pair}: {r.status_code} - {r.text}")
+                except Exception as e:
+                    log.warning(f"[BINANCE] Исключение для {sym+q}: {e}")
                     continue
 
         elif exchange == "bybit":
