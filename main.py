@@ -279,17 +279,23 @@ def build_review(symbol: str, is_forex: bool) -> tuple:
 async def analyze_crypto(symbol: str, exchange: str, live_price):
     sym = symbol.upper()
     name = COIN_NAMES.get(sym, sym)
-    p = live_price if (live_price and live_price > 0) else 1.0
+    
+    # 1. Проверяем, есть ли цена. Если нет — помечаем как None
+    has_price = live_price and isinstance(live_price, (int, float)) and live_price > 0
+    p = float(live_price) if has_price else None
 
+    # 2. Получаем историю
     history, chg24, chg7 = await fetch_coingecko_data(sym)
+    
     if not history:
         days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-        history = [{"day": d, "price": round(p * (0.97 + random.random() * 0.06), 6)} for d in days]
-        history[-1]["price"] = p
+        base_price = p if p else 0.0
+        history = [{"day": d, "price": round(base_price * (0.97 + random.random() * 0.06), 6)} for d in days]
+        history[-1]["price"] = base_price
         chg24 = chg7 = 0.0
 
-    # Обновить последнюю точку реальной ценой
-    history[-1]["price"] = p
+    if p is not None:
+        history[-1]["price"] = p
 
     review_text, recommendation = build_review(sym, False)
 
@@ -298,28 +304,28 @@ async def analyze_crypto(symbol: str, exchange: str, live_price):
         "symbol": sym,
         "exchange": exchange,
         "description": review_text,
-        "current_price_usd": p,
+        "current_price_usd": p, 
         "price_history_7d": history,
         "change_24h": chg24 or 0.0,
         "change_7d": chg7 or 0.0,
         "forecast": {
-            "predicted_7d": round(p * (1.03 if (chg7 or 0) >= 0 else 0.97), 6),
-            "predicted_30d": round(p * (1.08 if (chg7 or 0) >= 0 else 0.94), 6),
+            "predicted_7d": round(p * 1.03, 6) if p else 0.0,
+            "predicted_30d": round(p * 1.08, 6) if p else 0.0,
             "trend": "bullish" if (chg7 or 0) >= 0 else "bearish",
-            "confidence": 62,
-            "support": round(p * 0.92, 6),
-            "resistance": round(p * 1.10, 6),
+            "confidence": 62 if p else 0,
+            "support": round(p * 0.92, 6) if p else 0.0,
+            "resistance": round(p * 1.10, 6) if p else 0.0,
         },
         "ai_analysis": {
-            "summary": review_text,
+            "summary": review_text if p else "Данные о цене временно недоступны.",
             "risks": "Волатильность рынка, регуляторные новости.",
             "opportunity": "Следите за объёмами и уровнями поддержки.",
-            "recommendation": recommendation,
+            "recommendation": recommendation if p else "ожидание",
             "sentiment": "позитивный" if (chg24 or 0) >= 0 else "осторожный",
         },
         "metrics": {
             "volatility": "высокая" if abs(chg24 or 0) > 3 else "средняя",
-            "liquidity": "высокая",
+            "liquidity": "высокая" if p else "нет данных",
         },
     }
 
