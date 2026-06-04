@@ -584,6 +584,12 @@ async def handle_message(message: types.Message):
 
         full_name = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
 
+        mon_text = "\n".join(
+            f"• {m['symbol']} ({m['exchange']})"
+            for m in mon_list
+        ) if mon_list else "Нет мониторингов"
+
+        
         text = (
             f"👤 *@{escape_md2(username)}*\n"
             f"ID: `{u['tg_id']}`\n"
