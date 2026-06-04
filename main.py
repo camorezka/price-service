@@ -407,8 +407,6 @@ TOP20 = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TON", "AVAX", "DOT",
 
 async def fetch_exchange_coins(exchange: str):
     try:
-        # Используем глобальный HTTP_CLIENT
-        async with HTTP_CLIENT as c:
             if exchange == "binance":
                 r = await c.get("https://api.binance.com/api/v3/ticker/24hr")
                 r.raise_for_status()
