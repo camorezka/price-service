@@ -408,7 +408,7 @@ TOP20 = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TON", "AVAX", "DOT",
 async def fetch_exchange_coins(exchange: str):
     try:
             if exchange == "binance":
-                r = await c.get("https://api.binance.com/api/v3/ticker/24hr")
+                r = await HTTP_CLIENT.get("https://api.binance.com/api/v3/ticker/24hr")
                 r.raise_for_status()
                 data = r.json()
                 coins = []
@@ -428,7 +428,7 @@ async def fetch_exchange_coins(exchange: str):
                 coins.sort(key=lambda x: x["vol"], reverse=True)
                 return coins[:100]
             if exchange == "bybit":
-                r = await c.get("https://api.bybit.com/v5/market/tickers", params={"category": "spot"})
+                r = await HTTP_CLIENT.get("https://api.bybit.com/v5/market/tickers", params={"category": "spot"})
                 r.raise_for_status()
                 lst = r.json().get("result", {}).get("list", [])
                 coins = []
@@ -448,7 +448,7 @@ async def fetch_exchange_coins(exchange: str):
                 coins.sort(key=lambda x: x["vol"], reverse=True)
                 return coins[:100]
             if exchange == "okx":
-                r = await c.get("https://www.okx.com/api/v5/market/tickers", params={"instType": "SPOT"})
+                r = await HTTP_CLIENT.get("https://www.okx.com/api/v5/market/tickers", params={"instType": "SPOT"})
                 r.raise_for_status()
                 lst = r.json().get("data", [])
                 coins = []
@@ -520,7 +520,7 @@ async def price_watcher():
                         f"*{sign}{escape_md2(str(round(abs(change_pct), 2)))}%*\n"
                         f"Было: `{old_f}`\n"
                         f"Сейчас: `{new_f}`\n"
-                        f"_Crypto Space_"
+                        f"_Monitor Space_"
                     )
                     if bot:
                         try:
@@ -556,12 +556,12 @@ async def run_bot_polling():
 async def cmd_start(message: types.Message):
     kb = types.InlineKeyboardMarkup(inline_keyboard=[[
         types.InlineKeyboardButton(
-            text="🚀 Открыть Crypto Space",
+            text="🚀 Открыть Monitor Space",
             web_app=types.WebAppInfo(url="https://camorezka.github.io/price-service-site/")
         )
     ]])
     await message.answer(
-        "👋 Привет\\! *Crypto Space* — мониторинг крипты и форекса в реальном времени\\.\n\nНажми кнопку ниже 👇",
+        "👋 Привет\\! *Monitor Space* — мониторинг крипты и форекса в реальном времени\\.\n\nНажми кнопку ниже 👇",
         reply_markup=kb, parse_mode="MarkdownV2"
     )
 
@@ -636,7 +636,7 @@ async def shutdown_event():
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "Crypto Space", "version": "4.0"}
+    return {"status": "ok", "service": "Monitor Space", "version": "4.0"}
 
 @app.post("/auth")
 async def auth(request: Request):
