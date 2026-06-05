@@ -8,8 +8,11 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from supabase import create_client
 import random
 
@@ -30,12 +33,23 @@ HTTP_CLIENT = httpx.AsyncClient(
 )
 
 bot      = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
-dp       = Dispatcher()
+storage  = MemoryStorage()
+dp       = Dispatcher(storage=storage)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
                    allow_methods=["*"], allow_headers=["*"])
+
+# ── FSM STATES ────────────────────────────────────────────────────────────────
+
+class AdminState(StatesGroup):
+    waiting_username    = State()   # ввод username для поиска
+    viewing_user        = State()   # просмотр пользователя
+    waiting_add_slots   = State()   # ввод числа слотов для добавления
+    waiting_broadcast   = State()   # ввод текста рассылки
+
+# Хранилище текущего tg_id просматриваемого пользователя (в FSM data)
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -87,7 +101,6 @@ BINANCE_HOSTS = [
 ]
 
 async def fetch_binance_price(sym: str) -> float | None:
-    # Только USDT — никаких USDC/BUSD чтобы не было артефактов в названиях
     pair = sym + "USDT"
     for host in BINANCE_HOSTS:
         try:
@@ -115,22 +128,6 @@ async def fetch_crypto_price(symbol: str, exchange: str):
     try:
         if exchange == "binance":
             return await fetch_binance_price(sym)
-
-        elif exchange == "bybit":
-            for cat in ("spot", "linear"):
-                try:
-                    r = await HTTP_CLIENT.get(
-                        "https://api.bybit.com/v5/market/tickers",
-                        params={"category": cat, "symbol": sym + "USDT"}
-                    )
-                    if r.status_code == 200:
-                        lst = r.json().get("result", {}).get("list", [])
-                        if lst:
-                            px = safe_float(lst[0].get("lastPrice"))
-                            if px > 0:
-                                return px
-                except Exception as e:
-                    log.warning("[BYBIT] %s/%s: %s", cat, sym, e)
 
         elif exchange == "okx":
             r = await HTTP_CLIENT.get(
@@ -316,98 +313,47 @@ def build_review(symbol: str, is_forex: bool) -> tuple:
         return FOREX_REVIEWS.get(symbol, ("Стабильная валюта для диверсификации портфеля. Следите за действиями центрального банка и макроэкономическими данными.", "держать"))
     return COIN_REVIEWS.get(symbol, ("Перспективный актив с растущей экосистемой. Следите за объёмами торгов, новостями команды и общим настроением рынка.", "держать"))
 
-# ── FORECAST HELPERS ──────────────────────────────────────────────────────────
+# ── FORECAST ──────────────────────────────────────────────────────────────────
 
 def calc_forecast(p: float, chg24: float, chg7: float) -> dict:
-    """
-    Реалистичный прогноз на основе скользящей динамики:
-    - chg24 отражает краткосрочный импульс
-    - chg7  отражает недельный тренд
-    Прогноз 7d: экстраполяция недельного тренда с затуханием (50%)
-    Прогноз 30d: более консервативная экстраполяция (30% от месячного тренда)
-    Уровни поддержки/сопротивления: 8% и 12% от цены (типичный ATR для крипто)
-    """
     if not p or p <= 0:
-        return {
-            "predicted_7d": 0.0, "predicted_30d": 0.0,
-            "trend": "neutral", "confidence": 0,
-            "support": 0.0, "resistance": 0.0,
-        }
-
-    # Недельный тренд с затуханием — рынок не движется по прямой
-    trend_7d  = (chg7 or 0.0) * 0.5          # 50% от наблюдаемого 7d-движения
-    trend_30d = (chg7 or 0.0) * 4 * 0.3      # Экстраполяция на месяц с коэффициентом 0.3
-
-    # Ограничиваем экстремальные значения: не более ±40% за 7d, ±80% за 30d
-    trend_7d  = max(-40.0, min(40.0, trend_7d))
-    trend_30d = max(-80.0, min(80.0, trend_30d))
-
-    pred_7d  = round(p * (1 + trend_7d  / 100), 6)
-    pred_30d = round(p * (1 + trend_30d / 100), 6)
-
-    # Уровни поддержки и сопротивления (типичный диапазон ±8–12%)
+        return {"predicted_7d": 0.0, "predicted_30d": 0.0, "trend": "neutral", "confidence": 0, "support": 0.0, "resistance": 0.0}
+    trend_7d  = max(-40.0, min(40.0, (chg7 or 0.0) * 0.5))
+    trend_30d = max(-80.0, min(80.0, (chg7 or 0.0) * 4 * 0.3))
+    pred_7d   = round(p * (1 + trend_7d  / 100), 6)
+    pred_30d  = round(p * (1 + trend_30d / 100), 6)
     support    = round(p * 0.92, 6)
     resistance = round(p * 1.12, 6)
-
-    # Уверенность: базовая 55%, +5% при совпадении направления chg24 и chg7
     confidence = 55
-    if (chg24 or 0) * (chg7 or 0) > 0:
-        confidence += 5  # тренд подтверждён двумя таймфреймами
-    if abs(chg24 or 0) < 1.0:
-        confidence += 3  # низкая краткосрочная волатильность = более предсказуемо
-
-    if (chg7 or 0) > 3:
-        trend_label = "bullish"
-    elif (chg7 or 0) < -3:
-        trend_label = "bearish"
-    else:
-        trend_label = "sideways"
-
-    return {
-        "predicted_7d":  pred_7d,
-        "predicted_30d": pred_30d,
-        "trend":         trend_label,
-        "confidence":    confidence,
-        "support":       support,
-        "resistance":    resistance,
-    }
+    if (chg24 or 0) * (chg7 or 0) > 0: confidence += 5
+    if abs(chg24 or 0) < 1.0:           confidence += 3
+    trend_label = "bullish" if (chg7 or 0) > 3 else ("bearish" if (chg7 or 0) < -3 else "sideways")
+    return {"predicted_7d": pred_7d, "predicted_30d": pred_30d, "trend": trend_label,
+            "confidence": confidence, "support": support, "resistance": resistance}
 
 # ── CRYPTO ANALYZE ────────────────────────────────────────────────────────────
 
 async def analyze_crypto(symbol: str, exchange: str, live_price):
     sym  = symbol.upper()
     name = COIN_NAMES.get(sym, sym)
-    has_price = live_price and isinstance(live_price, (int, float)) and live_price > 0
-    p = float(live_price) if has_price else None
-
+    p    = float(live_price) if (live_price and isinstance(live_price, (int, float)) and live_price > 0) else None
     history, chg24, chg7 = await fetch_coingecko_data(sym)
-
     if not history:
         days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
         base_price = p if p else 0.0
         history = [{"day": d, "price": round(base_price * (0.97 + random.random() * 0.06), 6)} for d in days]
         history[-1]["price"] = base_price
         chg24 = chg7 = 0.0
-
     if p is not None:
         history[-1]["price"] = p
-
     chg24 = chg24 or 0.0
     chg7  = chg7  or 0.0
-
     review_text, recommendation = build_review(sym, False)
     forecast = calc_forecast(p or 0.0, chg24, chg7)
-
     return {
-        "name":             name,
-        "symbol":           sym,
-        "exchange":         exchange,
-        "description":      review_text,
-        "current_price_usd": p,
-        "price_history_7d": history,
-        "change_24h":       chg24,
-        "change_7d":        chg7,
-        "forecast":         forecast,
+        "name": name, "symbol": sym, "exchange": exchange, "description": review_text,
+        "current_price_usd": p, "price_history_7d": history,
+        "change_24h": chg24, "change_7d": chg7, "forecast": forecast,
         "ai_analysis": {
             "summary":        review_text if p else "Данные о цене временно недоступны.",
             "risks":          "Волатильность крипторынка, регуляторные новости, изменения ликвидности.",
@@ -452,41 +398,30 @@ async def analyze_forex(base: str, quote: str, live_rate):
     days       = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     history    = [{"day": d, "rate": round(rate * (0.985 + random.random() * 0.03), 6)} for d in days]
     history[-1]["rate"] = rate
-
     p_first = history[0]["rate"]
     p_last  = history[-1]["rate"]
     chg7    = round((p_last - p_first) / p_first * 100, 2) if p_first > 0 else 0.0
-
     review_text, recommendation = build_review(base, True)
-
     pred_7d  = round(rate * (1 + (chg7 * 0.3) / 100), 6)
     pred_30d = round(rate * (1 + (chg7 * 1.0) / 100), 6)
-
     return {
-        "base": base, "quote": quote,
-        "base_name": base_name, "quote_name": quote_name,
-        "description":    review_text,
-        "current_rate":   rate,
-        "rate_history_7d": history,
-        "change_24h":     0.0,
-        "change_7d":      chg7,
+        "base": base, "quote": quote, "base_name": base_name, "quote_name": quote_name,
+        "description": review_text, "current_rate": rate, "rate_history_7d": history,
+        "change_24h": 0.0, "change_7d": chg7,
         "forecast": {
-            "predicted_7d":  pred_7d,
-            "predicted_30d": pred_30d,
-            "trend":         "bullish" if chg7 >= 0 else "bearish",
-            "confidence":    60,
-            "support":    round(rate * 0.97, 6),
-            "resistance": round(rate * 1.03, 6),
+            "predicted_7d": pred_7d, "predicted_30d": pred_30d,
+            "trend": "bullish" if chg7 >= 0 else "bearish",
+            "confidence": 60, "support": round(rate * 0.97, 6), "resistance": round(rate * 1.03, 6),
         },
         "ai_analysis": {
-            "summary":        review_text,
-            "factors":        "Процентные ставки центробанка, инфляция, торговый баланс, геополитика.",
+            "summary": review_text,
+            "factors": "Процентные ставки центробанка, инфляция, торговый баланс, геополитика.",
             "recommendation": recommendation,
-            "sentiment":      "позитивный" if chg7 >= 0 else "осторожный",
+            "sentiment": "позитивный" if chg7 >= 0 else "осторожный",
         },
     }
 
-# ── COINS LIST FROM EXCHANGE ───────────────────────────────────────────────────
+# ── COINS LIST ─────────────────────────────────────────────────────────────────
 
 TOP20 = ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","TON","AVAX","DOT",
          "MATIC","LINK","UNI","LTC","ATOM","NEAR","OP","ARB","APT","SUI"]
@@ -496,71 +431,31 @@ async def fetch_exchange_coins(exchange: str):
         if exchange == "binance":
             r = await HTTP_CLIENT.get("https://data-api.binance.vision/api/v3/ticker/24hr")
             r.raise_for_status()
-            data  = r.json()
-            coins = []
-            seen  = set()
-            for item in data:
+            coins, seen = [], set()
+            for item in r.json():
                 s = item.get("symbol", "")
-                # Строго только USDT пары, исключаем USDC/BUSD/FDUSD
-                if s.endswith("USDT") and not any(s.startswith(x) for x in ("USDC", "BUSD", "FDUSD", "TUSD", "USDP")):
+                if s.endswith("USDT") and not any(s.startswith(x) for x in ("USDC","BUSD","FDUSD","TUSD","USDP")):
                     sym = s[:-4]
                     if sym not in seen and sym.isalpha():
                         seen.add(sym)
-                        coins.append({
-                            "sym":  sym,
-                            "name": COIN_NAMES.get(sym, sym),
-                            "vol":  safe_float(item.get("quoteVolume")),
-                            "chg":  round(safe_float(item.get("priceChangePercent")), 2)
-                        })
-            coins.sort(key=lambda x: x["vol"], reverse=True)
-            return coins[:100]
-
-        if exchange == "bybit":
-            r = await HTTP_CLIENT.get(
-                "https://api.bybit.com/v5/market/tickers",
-                params={"category": "spot"}
-            )
-            r.raise_for_status()
-            lst   = r.json().get("result", {}).get("list", [])
-            coins = []
-            seen  = set()
-            for item in lst:
-                s = item.get("symbol", "")
-                if s.endswith("USDT"):
-                    sym = s[:-4]
-                    if sym not in seen:
-                        seen.add(sym)
-                        coins.append({
-                            "sym":  sym,
-                            "name": COIN_NAMES.get(sym, sym),
-                            # turnover24h — объём в USDT (правильная сортировка)
-                            "vol":  safe_float(item.get("turnover24h")),
-                            "chg":  round(safe_float(item.get("price24hPcnt", "0")) * 100, 2)
-                        })
+                        coins.append({"sym": sym, "name": COIN_NAMES.get(sym, sym),
+                                      "vol": safe_float(item.get("quoteVolume")),
+                                      "chg": round(safe_float(item.get("priceChangePercent")), 2)})
             coins.sort(key=lambda x: x["vol"], reverse=True)
             return coins[:100]
 
         if exchange == "okx":
-            r = await HTTP_CLIENT.get(
-                "https://www.okx.com/api/v5/market/tickers",
-                params={"instType": "SPOT"}
-            )
+            r = await HTTP_CLIENT.get("https://www.okx.com/api/v5/market/tickers", params={"instType": "SPOT"})
             r.raise_for_status()
-            lst   = r.json().get("data", [])
-            coins = []
-            seen  = set()
-            for item in lst:
+            coins, seen = [], set()
+            for item in r.json().get("data", []):
                 s = item.get("instId", "")
                 if s.endswith("-USDT"):
                     sym = s[:-5]
                     if sym not in seen:
                         seen.add(sym)
-                        coins.append({
-                            "sym":  sym,
-                            "name": COIN_NAMES.get(sym, sym),
-                            "vol":  safe_float(item.get("volCcy24h")),
-                            "chg":  0.0
-                        })
+                        coins.append({"sym": sym, "name": COIN_NAMES.get(sym, sym),
+                                      "vol": safe_float(item.get("volCcy24h")), "chg": 0.0})
             coins.sort(key=lambda x: x["vol"], reverse=True)
             return coins[:100]
 
@@ -582,75 +477,137 @@ async def price_watcher():
             if not supabase:
                 await asyncio.sleep(300)
                 continue
-
             rows = supabase.table("crypto_monitors").select("*").execute()
             data = rows.data or []
             log.info("[WATCHER] Проверяем %d записей", len(data))
-
             for row in data:
                 sym       = row.get("symbol", "")
                 exchange  = row.get("exchange", "binance")
                 tg_id     = row.get("tg_id")
                 old_px    = safe_float(row.get("last_price") or row.get("price_at_add"))
                 alert_pct = safe_float(row.get("alert_pct"), 5.0)
-
                 if not sym or not tg_id:
                     continue
-
                 if "/" in sym:
                     parts  = sym.split("/")
                     new_px = await fetch_forex_rate(parts[0], parts[1])
                 else:
                     new_px = await fetch_crypto_price(sym, exchange)
-
                 if not new_px or new_px <= 0:
                     continue
-
                 if old_px <= 0:
-                    supabase.table("crypto_monitors").update({
-                        "price_at_add": new_px,
-                        "last_price":   new_px,
-                    }).eq("id", row["id"]).execute()
-                    log.info("[WATCHER] Инициализирована цена %s = %s", sym, new_px)
+                    supabase.table("crypto_monitors").update({"price_at_add": new_px, "last_price": new_px}).eq("id", row["id"]).execute()
                     continue
-
                 change_pct = (new_px - old_px) / old_px * 100
-
                 if abs(change_pct) >= alert_pct:
                     direction = "📈 выросла" if change_pct > 0 else "📉 упала"
                     sign      = "\\+" if change_pct > 0 else "\\-"
                     label     = sym if "/" in sym else f"{sym} \\({exchange.upper()}\\)"
-                    old_f     = escape_md2(fmt_price(old_px))
-                    new_f     = escape_md2(fmt_price(new_px))
                     msg = (
                         f"🔔 *{escape_md2(label)}* {direction} на "
                         f"*{sign}{escape_md2(str(round(abs(change_pct), 2)))}%*\n"
-                        f"Было: `{old_f}`\n"
-                        f"Сейчас: `{new_f}`\n"
+                        f"Было: `{escape_md2(fmt_price(old_px))}`\n"
+                        f"Сейчас: `{escape_md2(fmt_price(new_px))}`\n"
                         f"_Monitor Space_"
                     )
                     if bot:
                         try:
                             await bot.send_message(chat_id=tg_id, text=msg, parse_mode="MarkdownV2")
-                            log.info("[ALERT] %s → %s %.2f%%", sym, tg_id, change_pct)
                         except Exception as te:
                             log.warning("[ALERT TG] %s", te)
                     supabase.table("crypto_monitors").update({
-                        "last_price":   new_px,
-                        "last_alerted": datetime.now(timezone.utc).isoformat(),
+                        "last_price": new_px, "last_alerted": datetime.now(timezone.utc).isoformat()
                     }).eq("id", row["id"]).execute()
                 else:
-                    supabase.table("crypto_monitors").update({
-                        "last_price": new_px
-                    }).eq("id", row["id"]).execute()
-
+                    supabase.table("crypto_monitors").update({"last_price": new_px}).eq("id", row["id"]).execute()
                 await asyncio.sleep(0.5)
-
         except Exception as fatal:
             log.error("[WATCHER FATAL] %s", fatal)
             await asyncio.sleep(300)
 
-# ── БОТ ───────────────────────────────────────────────────────────────────────
+# ── ADMIN HELPERS ─────────────────────────────────────────────────────────────
+
+def admin_main_keyboard() -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="admin:find_user"),
+            types.InlineKeyboardButton(text="📊 Статистика",         callback_data="admin:stats"),
+        ],
+        [
+            types.InlineKeyboardButton(text="📢 Рассылка",           callback_data="admin:broadcast"),
+            types.InlineKeyboardButton(text="👥 Список юзеров",      callback_data="admin:user_list"),
+        ],
+    ])
+
+def user_action_keyboard(target_tg_id: int, username: str) -> types.InlineKeyboardMarkup:
+    uid = str(target_tg_id)
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text="➕ Добавить слоты",     callback_data=f"admin:add_slots:{uid}"),
+            types.InlineKeyboardButton(text="🗑 Сбросить мониторинги", callback_data=f"admin:reset_monitors:{uid}"),
+        ],
+        [
+            types.InlineKeyboardButton(text="✉️ Написать юзеру",     callback_data=f"admin:msg_user:{uid}"),
+            types.InlineKeyboardButton(text="🔄 Обновить данные",    callback_data=f"admin:refresh_user:{uid}"),
+        ],
+        [
+            types.InlineKeyboardButton(text="◀️ Назад в панель",     callback_data="admin:back"),
+        ],
+    ])
+
+async def get_user_info_text(tg_id: int) -> tuple[str, list]:
+    """Возвращает (текст, список мониторингов)"""
+    if not supabase:
+        return "❌ БД недоступна", []
+    res = supabase.table("users").select("*").eq("tg_id", tg_id).execute()
+    if not res.data:
+        return "❌ Пользователь не найден", []
+    u         = res.data[0]
+    monitors  = supabase.table("crypto_monitors").select("*").eq("tg_id", tg_id).execute()
+    mon_list  = monitors.data or []
+    full_name = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
+
+    # Считаем активные за 7 дней
+    now = datetime.now(timezone.utc)
+    active_count = 0
+    for m in mon_list:
+        la = m.get("last_alerted")
+        if not la:
+            continue
+        try:
+            la_dt = datetime.fromisoformat(str(la).replace("Z", "+00:00"))
+            if la_dt.tzinfo is None:
+                la_dt = la_dt.replace(tzinfo=timezone.utc)
+            if la_dt >= (now - timedelta(days=7)):
+                active_count += 1
+        except Exception:
+            pass
+
+    mon_lines = []
+    for m in mon_list:
+        la = m.get("last_alerted", "—")
+        la_str = str(la)[:10] if la else "—"
+        mon_lines.append(f"  • {m['symbol']} \\({m['exchange']}\\) — последний запуск: {escape_md2(la_str)}")
+    mon_text = "\n".join(mon_lines) if mon_lines else "  нет мониторингов"
+
+    text = (
+        f"👤 *@{escape_md2(u.get('username',''))}*\n"
+        f"ID: `{tg_id}`\n"
+        f"Имя: {escape_md2(full_name)}\n"
+        f"IP рег: `{escape_md2(u.get('reg_ip',''))}`\n"
+        f"Последний IP: `{escape_md2(u.get('last_ip',''))}`\n"
+        f"Платформа: {escape_md2(u.get('platform',''))}\n"
+        f"Язык: {u.get('language','')}\n"
+        f"Визитов: {u.get('visit_count', 0)}\n"
+        f"Регистрация: {escape_md2(str(u.get('created_at',''))[:10])}\n"
+        f"Последний вход: {escape_md2(str(u.get('last_seen',''))[:10])}\n"
+        f"User\\-Agent: `{escape_md2((u.get('user_agent','') or '')[:60])}`\n\n"
+        f"📊 *Мониторинги \\({len(mon_list)} всего, {active_count}/3 активных за неделю\\):*\n"
+        f"{mon_text}"
+    )
+    return text, mon_list
+
+# ── БОТ — КОМАНДЫ ─────────────────────────────────────────────────────────────
 
 async def run_bot_polling():
     if not bot:
@@ -675,49 +632,377 @@ async def cmd_start(message: types.Message):
     )
 
 @dp.message(Command("admin"))
-async def cmd_admin(message: types.Message):
+async def cmd_admin(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_TG_ID:
         await message.answer("⛔ Нет доступа.")
         return
+    await state.clear()
+    if not supabase:
+        await message.answer("⚠️ БД не подключена.")
+        return
+    total_users    = len((supabase.table("users").select("id").execute()).data or [])
+    total_monitors = len((supabase.table("crypto_monitors").select("id").execute()).data or [])
     await message.answer(
-        "🛡 *Админ панель*\n\nОтправь username пользователя \\(без @\\) чтобы получить данные:",
+        f"🛡 *Админ панель — Monitor Space*\n\n"
+        f"👥 Пользователей: *{total_users}*\n"
+        f"📡 Мониторингов в БД: *{total_monitors}*\n\n"
+        f"Выбери действие:",
+        reply_markup=admin_main_keyboard(),
         parse_mode="MarkdownV2"
     )
 
-@dp.message()
-async def handle_message(message: types.Message):
-    if message.from_user.id != ADMIN_TG_ID or not supabase:
+# ── CALLBACK-ХЕНДЛЕРЫ АДМИНКИ ─────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "admin:back")
+async def cb_admin_back(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_TG_ID:
+        return await call.answer("⛔")
+    await state.clear()
+    if not supabase:
+        return await call.answer("БД недоступна")
+    total_users    = len((supabase.table("users").select("id").execute()).data or [])
+    total_monitors = len((supabase.table("crypto_monitors").select("id").execute()).data or [])
+    await call.message.edit_text(
+        f"🛡 *Админ панель — Monitor Space*\n\n"
+        f"👥 Пользователей: *{total_users}*\n"
+        f"📡 Мониторингов в БД: *{total_monitors}*\n\n"
+        f"Выбери действие:",
+        reply_markup=admin_main_keyboard(),
+        parse_mode="MarkdownV2"
+    )
+    await call.answer()
+
+@dp.callback_query(F.data == "admin:find_user")
+async def cb_find_user(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_TG_ID:
+        return await call.answer("⛔")
+    await state.set_state(AdminState.waiting_username)
+    await call.message.edit_text(
+        "🔍 Введи *username* пользователя \\(без @\\) или его *Telegram ID*:",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
+        ]]),
+        parse_mode="MarkdownV2"
+    )
+    await call.answer()
+
+@dp.callback_query(F.data == "admin:stats")
+async def cb_stats(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_TG_ID:
+        return await call.answer("⛔")
+    if not supabase:
+        return await call.answer("БД недоступна")
+    try:
+        users    = supabase.table("users").select("created_at, visit_count, platform").execute().data or []
+        monitors = supabase.table("crypto_monitors").select("exchange, last_alerted, symbol").execute().data or []
+        now = datetime.now(timezone.utc)
+
+        # Новые за 24ч и 7д
+        new_24h = sum(1 for u in users if u.get("created_at") and
+                      datetime.fromisoformat(str(u["created_at"]).replace("Z","+00:00")).replace(tzinfo=timezone.utc) >= now - timedelta(hours=24))
+        new_7d  = sum(1 for u in users if u.get("created_at") and
+                      datetime.fromisoformat(str(u["created_at"]).replace("Z","+00:00")).replace(tzinfo=timezone.utc) >= now - timedelta(days=7))
+
+        # Активные мониторинги за 7д
+        active_mon = sum(1 for m in monitors if m.get("last_alerted") and
+                         datetime.fromisoformat(str(m["last_alerted"]).replace("Z","+00:00")).replace(tzinfo=timezone.utc) >= now - timedelta(days=7))
+
+        # Топ платформы
+        platforms: dict = {}
+        for u in users:
+            p = (u.get("platform") or "unknown").lower()[:20]
+            platforms[p] = platforms.get(p, 0) + 1
+        top_plat = sorted(platforms.items(), key=lambda x: x[1], reverse=True)[:4]
+        plat_str = "\n".join(f"  {escape_md2(p)}: {c}" for p, c in top_plat) or "  нет данных"
+
+        # Топ монеты
+        syms: dict = {}
+        for m in monitors:
+            s = m.get("symbol","")
+            syms[s] = syms.get(s, 0) + 1
+        top_sym = sorted(syms.items(), key=lambda x: x[1], reverse=True)[:5]
+        sym_str = "\n".join(f"  {escape_md2(s)}: {c}" for s, c in top_sym) or "  нет данных"
+
+        total_visits = sum(u.get("visit_count", 0) or 0 for u in users)
+
+        text = (
+            f"📊 *Статистика Monitor Space*\n\n"
+            f"👥 Всего пользователей: *{len(users)}*\n"
+            f"  \\+{new_24h} за 24ч, \\+{new_7d} за 7д\n"
+            f"📲 Всего визитов: *{total_visits}*\n\n"
+            f"📡 Мониторингов в БД: *{len(monitors)}*\n"
+            f"  Активных за 7д: *{active_mon}*\n\n"
+            f"📱 *Топ платформы:*\n{plat_str}\n\n"
+            f"🪙 *Топ монеты:*\n{sym_str}"
+        )
+        await call.message.edit_text(
+            text,
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
+            ]]),
+            parse_mode="MarkdownV2"
+        )
+    except Exception as e:
+        await call.message.edit_text(f"⚠️ Ошибка: {escape_md2(str(e))}",
+                                     reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                                         types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
+                                     ]]), parse_mode="MarkdownV2")
+    await call.answer()
+
+@dp.callback_query(F.data == "admin:user_list")
+async def cb_user_list(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_TG_ID:
+        return await call.answer("⛔")
+    if not supabase:
+        return await call.answer("БД недоступна")
+    try:
+        users = supabase.table("users").select("tg_id, username, first_name, last_seen, visit_count") \
+            .order("last_seen", desc=True).limit(20).execute().data or []
+        if not users:
+            lines = ["Нет пользователей"]
+        else:
+            lines = []
+            for u in users:
+                name = u.get("username") or u.get("first_name") or "—"
+                seen = str(u.get("last_seen",""))[:10]
+                lines.append(f"• @{escape_md2(name)} \\(`{u['tg_id']}`\\) — {escape_md2(seen)}, визитов: {u.get('visit_count',0)}")
+        text = "👥 *Последние 20 пользователей* \\(по дате активности\\):\n\n" + "\n".join(lines)
+        await call.message.edit_text(
+            text,
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
+            ]]),
+            parse_mode="MarkdownV2"
+        )
+    except Exception as e:
+        await call.answer(f"Ошибка: {e}", show_alert=True)
+    await call.answer()
+
+@dp.callback_query(F.data == "admin:broadcast")
+async def cb_broadcast(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_TG_ID:
+        return await call.answer("⛔")
+    await state.set_state(AdminState.waiting_broadcast)
+    await call.message.edit_text(
+        "📢 Введи текст рассылки\\.\n"
+        "Поддерживается *MarkdownV2*\\.\n"
+        "Будет отправлено *всем* пользователям в БД\\.\n\n"
+        "Отправь /cancel чтобы отменить:",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(text="◀️ Отмена", callback_data="admin:back")
+        ]]),
+        parse_mode="MarkdownV2"
+    )
+    await call.answer()
+
+# Кнопки для просматриваемого пользователя
+
+@dp.callback_query(F.data.startswith("admin:add_slots:"))
+async def cb_add_slots(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_TG_ID:
+        return await call.answer("⛔")
+    target_id = int(call.data.split(":")[2])
+    await state.set_state(AdminState.waiting_add_slots)
+    await state.update_data(target_tg_id=target_id)
+    await call.message.edit_text(
+        f"➕ Добавить слоты пользователю `{target_id}`\\.\n\n"
+        f"Введи число слотов \\(1\\-10\\)\\.\n"
+        f"Слоты добавляются путём сброса `last_alerted` у старых записей \\(освобождает места в недельном лимите\\)\\.\n\n"
+        f"Отправь число:",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(text="◀️ Отмена", callback_data=f"admin:refresh_user:{target_id}")
+        ]]),
+        parse_mode="MarkdownV2"
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("admin:reset_monitors:"))
+async def cb_reset_monitors(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_TG_ID:
+        return await call.answer("⛔")
+    target_id = int(call.data.split(":")[2])
+    if not supabase:
+        return await call.answer("БД недоступна", show_alert=True)
+    try:
+        # Сбрасываем last_alerted у всех записей — полный сброс недельного лимита
+        supabase.table("crypto_monitors").update({"last_alerted": None}).eq("tg_id", target_id).execute()
+        await call.answer("✅ Мониторинги сброшены — лимит обнулён", show_alert=True)
+        # Обновляем карточку пользователя
+        text, _ = await get_user_info_text(target_id)
+        user_res = supabase.table("users").select("username").eq("tg_id", target_id).execute()
+        uname    = (user_res.data[0].get("username","") if user_res.data else "") or str(target_id)
+        await call.message.edit_text(text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="MarkdownV2")
+    except Exception as e:
+        await call.answer(f"Ошибка: {e}", show_alert=True)
+
+@dp.callback_query(F.data.startswith("admin:msg_user:"))
+async def cb_msg_user(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_TG_ID:
+        return await call.answer("⛔")
+    target_id = int(call.data.split(":")[2])
+    await state.set_state(AdminState.waiting_broadcast)
+    await state.update_data(broadcast_target=target_id)  # одиночная отправка
+    await call.message.edit_text(
+        f"✉️ Введи сообщение для пользователя `{target_id}`\\.\n"
+        f"Поддерживается *MarkdownV2*\\.\n\n"
+        f"Отправь /cancel чтобы отменить:",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(text="◀️ Отмена", callback_data=f"admin:refresh_user:{target_id}")
+        ]]),
+        parse_mode="MarkdownV2"
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("admin:refresh_user:"))
+async def cb_refresh_user(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_TG_ID:
+        return await call.answer("⛔")
+    target_id = int(call.data.split(":")[2])
+    if not supabase:
+        return await call.answer("БД недоступна", show_alert=True)
+    text, _ = await get_user_info_text(target_id)
+    user_res = supabase.table("users").select("username").eq("tg_id", target_id).execute()
+    uname    = (user_res.data[0].get("username","") if user_res.data else "") or str(target_id)
+    await call.message.edit_text(text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="MarkdownV2")
+    await call.answer("🔄 Обновлено")
+
+# ── FSM MESSAGE HANDLERS ──────────────────────────────────────────────────────
+
+@dp.message(AdminState.waiting_username)
+async def fsm_waiting_username(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_TG_ID:
         return
-    username = message.text.strip().lstrip("@")
-    if not username:
+    if not supabase:
+        await message.answer("❌ БД недоступна")
+        return
+    query = message.text.strip().lstrip("@")
+    try:
+        # Ищем по username или по tg_id
+        if query.isdigit():
+            res = supabase.table("users").select("*").eq("tg_id", int(query)).execute()
+        else:
+            res = supabase.table("users").select("*").eq("username", query).execute()
+        if not res.data:
+            await message.answer(
+                f"❌ Пользователь *{escape_md2(query)}* не найден в базе\\.",
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                    types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
+                ]]),
+                parse_mode="MarkdownV2"
+            )
+            return
+        u         = res.data[0]
+        target_id = u["tg_id"]
+        uname     = u.get("username","") or str(target_id)
+        text, _   = await get_user_info_text(target_id)
+        await state.set_state(AdminState.viewing_user)
+        await state.update_data(target_tg_id=target_id)
+        await message.answer(text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="MarkdownV2")
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка: {escape_md2(str(e))}", parse_mode="MarkdownV2")
+
+@dp.message(AdminState.waiting_add_slots)
+async def fsm_waiting_add_slots(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    if not supabase:
+        await message.answer("❌ БД недоступна")
+        return
+    text_in = message.text.strip()
+    if not text_in.isdigit() or not (1 <= int(text_in) <= 10):
+        await message.answer("⚠️ Введи число от 1 до 10")
+        return
+    slots     = int(text_in)
+    data      = await state.get_data()
+    target_id = data.get("target_tg_id")
+    if not target_id:
+        await message.answer("❌ Цель не найдена, начни заново")
+        await state.clear()
         return
     try:
-        res = supabase.table("users").select("*").eq("username", username).execute()
-        if not res.data:
-            await message.answer(f"❌ Пользователь @{username} не найден в базе.")
-            return
-        u        = res.data[0]
-        monitors = supabase.table("crypto_monitors").select("*").eq("tg_id", u["tg_id"]).execute()
-        mon_list = monitors.data or []
-        full_name = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
-        mon_text  = "\n".join(f"• {m['symbol']} ({m['exchange']})" for m in mon_list) if mon_list else "Нет мониторингов"
-        text = (
-            f"👤 *@{escape_md2(username)}*\n"
-            f"ID: `{u['tg_id']}`\n"
-            f"Имя: {escape_md2(full_name)}\n"
-            f"IP рег: `{escape_md2(u.get('reg_ip',''))}`\n"
-            f"Последний IP: `{escape_md2(u.get('last_ip',''))}`\n"
-            f"Платформа: {escape_md2(u.get('platform',''))}\n"
-            f"Язык: {u.get('language','')}\n"
-            f"Визитов: {u.get('visit_count',0)}\n"
-            f"Регистрация: {escape_md2(str(u.get('created_at',''))[:10])}\n"
-            f"Последний вход: {escape_md2(str(u.get('last_seen',''))[:10])}\n"
-            f"User\\-Agent: `{escape_md2((u.get('user_agent','') or '')[:60])}`\n\n"
-            f"📊 *Мониторинги \\({len(mon_list)}\\):*\n{escape_md2(mon_text)}"
+        # Берём самые старые активные записи и сбрасываем им last_alerted
+        monitors = supabase.table("crypto_monitors").select("id, last_alerted") \
+            .eq("tg_id", target_id).execute().data or []
+        now = datetime.now(timezone.utc)
+        active = []
+        for m in monitors:
+            la = m.get("last_alerted")
+            if not la:
+                continue
+            try:
+                la_dt = datetime.fromisoformat(str(la).replace("Z", "+00:00"))
+                if la_dt.tzinfo is None:
+                    la_dt = la_dt.replace(tzinfo=timezone.utc)
+                if la_dt >= now - timedelta(days=7):
+                    active.append((la_dt, m["id"]))
+            except Exception:
+                pass
+        # Сортируем по дате (сбрасываем старейшие)
+        active.sort(key=lambda x: x[0])
+        freed = 0
+        for _, mid in active[:slots]:
+            supabase.table("crypto_monitors").update({"last_alerted": None}).eq("id", mid).execute()
+            freed += 1
+
+        uname_res = supabase.table("users").select("username").eq("tg_id", target_id).execute()
+        uname     = (uname_res.data[0].get("username","") if uname_res.data else "") or str(target_id)
+        await message.answer(
+            f"✅ Освобождено *{freed}* слот\\(ов\\) для пользователя @{escape_md2(uname)}\\.\n"
+            f"Теперь он может запустить ещё {freed} мониторинг\\(ов\\) на этой неделе\\.",
+            parse_mode="MarkdownV2"
         )
-        await message.answer(text, parse_mode="MarkdownV2")
+        # Показываем обновлённую карточку
+        card_text, _ = await get_user_info_text(target_id)
+        await message.answer(card_text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="MarkdownV2")
+        await state.set_state(AdminState.viewing_user)
+        await state.update_data(target_tg_id=target_id)
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка: {e}")
+        await message.answer(f"⚠️ Ошибка: {escape_md2(str(e))}", parse_mode="MarkdownV2")
+
+@dp.message(AdminState.waiting_broadcast)
+async def fsm_waiting_broadcast(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    if message.text and message.text.strip() == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    if not supabase or not bot:
+        await message.answer("❌ БД или бот недоступны")
+        return
+    data      = await state.get_data()
+    single_id = data.get("broadcast_target")  # если задан — отправляем одному
+
+    try:
+        if single_id:
+            # Одиночное сообщение
+            await bot.send_message(chat_id=single_id, text=message.text, parse_mode="MarkdownV2")
+            await message.answer(f"✅ Сообщение отправлено пользователю `{single_id}`\\.", parse_mode="MarkdownV2")
+        else:
+            # Рассылка всем
+            users = supabase.table("users").select("tg_id").execute().data or []
+            ok, fail = 0, 0
+            status_msg = await message.answer(f"📢 Начинаю рассылку для {len(users)} пользователей\\.\\.\\.", parse_mode="MarkdownV2")
+            for u in users:
+                try:
+                    await bot.send_message(chat_id=u["tg_id"], text=message.text, parse_mode="MarkdownV2")
+                    ok += 1
+                except Exception:
+                    fail += 1
+                await asyncio.sleep(0.05)  # rate limit
+            await status_msg.edit_text(
+                f"✅ Рассылка завершена\\!\n✔️ Доставлено: *{ok}*\n❌ Ошибок: *{fail}*",
+                parse_mode="MarkdownV2"
+            )
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка: {escape_md2(str(e))}", parse_mode="MarkdownV2")
+
+    await state.clear()
+
+# Любое другое сообщение не от admina — игнорируем
+@dp.message()
+async def handle_other(message: types.Message, state: FSMContext):
+    pass
 
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 
@@ -732,7 +1017,7 @@ async def startup_event():
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "Monitor Space", "version": "4.2"}
+    return {"status": "ok", "service": "Monitor Space", "version": "5.0"}
 
 @app.post("/auth")
 async def auth(request: Request):
@@ -749,25 +1034,19 @@ async def auth(request: Request):
         if existing.data:
             cnt = existing.data[0].get("visit_count") or 0
             supabase.table("users").update({
-                "last_ip":    ip,
-                "last_seen":  now_iso,
+                "last_ip": ip, "last_seen": now_iso,
                 "user_agent": request.headers.get("user-agent", ""),
-                "platform":   str(data.get("platform") or ""),
-                "language":   str(data.get("language") or ""),
+                "platform": str(data.get("platform") or ""),
+                "language": str(data.get("language") or ""),
                 "visit_count": cnt + 1,
             }).eq("tg_id", tg_id).execute()
             return {"status": "ok", "already_registered": True}
         supabase.table("users").insert({
-            "tg_id":      tg_id,
-            "username":   str(data.get("username") or ""),
-            "first_name": str(data.get("first_name") or ""),
-            "last_name":  str(data.get("last_name") or ""),
-            "reg_ip":     ip, "last_ip": ip,
-            "user_agent": request.headers.get("user-agent", ""),
-            "platform":   str(data.get("platform") or ""),
-            "language":   str(data.get("language") or ""),
-            "last_seen":  now_iso, "created_at": now_iso,
-            "visit_count": 1,
+            "tg_id": tg_id, "username": str(data.get("username") or ""),
+            "first_name": str(data.get("first_name") or ""), "last_name": str(data.get("last_name") or ""),
+            "reg_ip": ip, "last_ip": ip, "user_agent": request.headers.get("user-agent", ""),
+            "platform": str(data.get("platform") or ""), "language": str(data.get("language") or ""),
+            "last_seen": now_iso, "created_at": now_iso, "visit_count": 1,
         }).execute()
         return {"status": "ok", "already_registered": False}
     except Exception as e:
@@ -777,11 +1056,11 @@ async def auth(request: Request):
 @app.post("/analyze")
 async def analyze_route(request: Request):
     try:
-        data       = await request.json()
-        symbol     = str(data.get("symbol") or "").strip().upper()
-        exchange   = str(data.get("exchange") or "binance").strip().lower()
-        tg_id      = data.get("id")
-        alert_pct  = safe_float(data.get("alert_pct"), 5.0)
+        data      = await request.json()
+        symbol    = str(data.get("symbol") or "").strip().upper()
+        exchange  = str(data.get("exchange") or "binance").strip().lower()
+        tg_id     = data.get("id")
+        alert_pct = safe_float(data.get("alert_pct"), 5.0)
         if not symbol:
             return JSONResponse({"status": "error", "message": "Укажите символ"}, status_code=400)
         live_price = await fetch_crypto_price(symbol, exchange)
@@ -794,10 +1073,8 @@ async def analyze_route(request: Request):
                     .eq("tg_id", tg_id).eq("symbol", symbol).eq("exchange", exchange).execute()
                 if existing.data:
                     supabase.table("crypto_monitors").update({
-                        "last_price":   final_px,
-                        "price_at_add": final_px,
-                        "alert_pct":    alert_pct,
-                        "added_at":     now_iso,
+                        "last_price": final_px, "price_at_add": final_px,
+                        "alert_pct": alert_pct, "added_at": now_iso,
                     }).eq("id", existing.data[0]["id"]).execute()
                 else:
                     supabase.table("crypto_monitors").insert({
@@ -833,10 +1110,8 @@ async def analyze_forex_route(request: Request):
                     .eq("tg_id", tg_id).eq("symbol", pair_sym).execute()
                 if existing.data:
                     supabase.table("crypto_monitors").update({
-                        "last_price":   final_r,
-                        "last_alerted": now_iso,
-                        "alert_pct":    alert_pct,
-                        "added_at":     now_iso,
+                        "last_price": final_r, "last_alerted": now_iso,
+                        "alert_pct": alert_pct, "added_at": now_iso,
                     }).eq("id", existing.data[0]["id"]).execute()
                 else:
                     supabase.table("crypto_monitors").insert({
@@ -889,7 +1164,6 @@ async def activate_monitor(request: Request):
     """
     Глобальный лимит: 3 уникальных мониторинга за 7 дней на пользователя.
     Счётчик считается по числу записей с last_alerted > (now - 7d).
-    После истечения 7 дней — лимит сбрасывается автоматически.
     """
     try:
         data     = await request.json()
@@ -903,23 +1177,19 @@ async def activate_monitor(request: Request):
             return JSONResponse({"status": "error", "message": "DB не настроена"}, status_code=500)
 
         now        = datetime.now(timezone.utc)
-        week_ago   = (now - timedelta(days=7)).isoformat()
         WEEK_LIMIT = 3
 
-        # ── Считаем сколько уникальных мониторингов активировано за последние 7 дней ──
-        all_user = supabase.table("crypto_monitors").select("id,symbol,exchange,last_alerted") \
+        all_user  = supabase.table("crypto_monitors").select("id,symbol,exchange,last_alerted,alerts_count") \
             .eq("tg_id", tg_id).execute()
         user_rows = all_user.data or []
 
-        # Активные за неделю — у которых last_alerted проставлено и в пределах 7 дней
         active_week = []
         for r in user_rows:
             la = r.get("last_alerted")
             if not la:
                 continue
-            la_str = str(la).replace("Z", "+00:00")
             try:
-                la_dt = datetime.fromisoformat(la_str)
+                la_dt = datetime.fromisoformat(str(la).replace("Z", "+00:00"))
                 if la_dt.tzinfo is None:
                     la_dt = la_dt.replace(tzinfo=timezone.utc)
                 if la_dt >= (now - timedelta(days=7)):
@@ -927,7 +1197,6 @@ async def activate_monitor(request: Request):
             except ValueError:
                 continue
 
-        # ── Проверяем: уже активирован ли ЭТОТ мониторинг пользователем ──
         this_record = next(
             (r for r in user_rows if r.get("symbol") == symbol and r.get("exchange") == exchange),
             None
@@ -936,63 +1205,41 @@ async def activate_monitor(request: Request):
             r["id"] == this_record["id"] for r in active_week
         )
 
-        # Если этот конкретный мониторинг уже активен — просто возвращаем статус
         if already_active:
-            used  = len(active_week)
-            remaining = max(0, WEEK_LIMIT - used)
-            return {"status": "ok", "remaining": remaining, "already_active": True}
+            used = len(active_week)
+            return {"status": "ok", "remaining": max(0, WEEK_LIMIT - used), "already_active": True}
 
-        # ── Проверяем лимит ──
         used = len(active_week)
         if used >= WEEK_LIMIT:
-            # Находим ближайшую дату сброса (самый старый last_alerted + 7 дней)
             oldest = min(active_week, key=lambda r: r.get("last_alerted", ""))
-            la_str = str(oldest["last_alerted"]).replace("Z", "+00:00")
             try:
-                reset_dt = datetime.fromisoformat(la_str)
+                reset_dt = datetime.fromisoformat(str(oldest["last_alerted"]).replace("Z", "+00:00"))
                 if reset_dt.tzinfo is None:
                     reset_dt = reset_dt.replace(tzinfo=timezone.utc)
                 reset_dt = reset_dt + timedelta(days=7)
                 delta    = reset_dt - now
                 hours    = int(delta.total_seconds() // 3600)
-                days_left = hours // 24
-                hrs_left  = hours % 24
-                if days_left > 0:
-                    reset_str = f"через {days_left} д. {hrs_left} ч."
-                else:
-                    reset_str = f"через {hrs_left} ч."
+                days_left, hrs_left = hours // 24, hours % 24
+                reset_str = f"через {days_left} д. {hrs_left} ч." if days_left > 0 else f"через {hrs_left} ч."
             except Exception:
                 reset_str = "через 7 дней"
-            return {
-                "status":    "error",
-                "message":   f"Лимит исчерпан — 3 запуска в неделю",
-                "reset_in":  reset_str,
-            }
+            return {"status": "error", "message": "Лимит исчерпан — 3 запуска в неделю", "reset_in": reset_str}
 
-        # ── Активируем ──
         if this_record:
-            # Запись уже есть — обновляем last_alerted
             supabase.table("crypto_monitors").update({
                 "last_alerted": now.isoformat(),
                 "alerts_count": (this_record.get("alerts_count") or 0) + 1,
             }).eq("id", this_record["id"]).execute()
         else:
-            # Создаём новую запись
             current_price = await fetch_crypto_price(symbol, exchange)
             supabase.table("crypto_monitors").insert({
-                "tg_id":        tg_id,
-                "symbol":       symbol,
-                "exchange":     exchange,
-                "alerts_count": 1,
-                "expires_at":   (now + timedelta(days=7)).isoformat(),
-                "last_alerted": now.isoformat(),
-                "price_at_add": current_price or 0,
-                "last_price":   current_price or 0,
-                "alert_pct":    5,
+                "tg_id": tg_id, "symbol": symbol, "exchange": exchange,
+                "alerts_count": 1, "expires_at": (now + timedelta(days=7)).isoformat(),
+                "last_alerted": now.isoformat(), "price_at_add": current_price or 0,
+                "last_price": current_price or 0, "alert_pct": 5,
             }).execute()
 
-        remaining = WEEK_LIMIT - (used + 1)
-        return {"status": "ok", "remaining": remaining}
+        return {"status": "ok", "remaining": WEEK_LIMIT - (used + 1)}
 
     except Exception as e:
         log.error("[ACTIVATE-MONITOR] %s", e)
