@@ -886,6 +886,11 @@ async def admin_get_user(username: str, request: Request):
 
 @app.post("/activate-monitor")
 async def activate_monitor(request: Request):
+    """
+    Глобальный лимит: 3 уникальных мониторинга за 7 дней на пользователя.
+    Счётчик считается по числу записей с last_alerted > (now - 7d).
+    После истечения 7 дней — лимит сбрасывается автоматически.
+    """
     try:
         data     = await request.json()
         tg_id    = data.get("tg_id")
@@ -897,47 +902,82 @@ async def activate_monitor(request: Request):
         if not supabase:
             return JSONResponse({"status": "error", "message": "DB не настроена"}, status_code=500)
 
-        now = datetime.now(timezone.utc)
+        now        = datetime.now(timezone.utc)
+        week_ago   = (now - timedelta(days=7)).isoformat()
+        WEEK_LIMIT = 3
 
-        existing = supabase.table("crypto_monitors").select("*") \
-            .eq("tg_id", tg_id).eq("symbol", symbol).eq("exchange", exchange).execute()
+        # ── Считаем сколько уникальных мониторингов активировано за последние 7 дней ──
+        all_user = supabase.table("crypto_monitors").select("id,symbol,exchange,last_alerted") \
+            .eq("tg_id", tg_id).execute()
+        user_rows = all_user.data or []
 
-        if existing.data:
-            m          = existing.data[0]
-            expires_at = m.get("expires_at")
+        # Активные за неделю — у которых last_alerted проставлено и в пределах 7 дней
+        active_week = []
+        for r in user_rows:
+            la = r.get("last_alerted")
+            if not la:
+                continue
+            la_str = str(la).replace("Z", "+00:00")
+            try:
+                la_dt = datetime.fromisoformat(la_str)
+                if la_dt.tzinfo is None:
+                    la_dt = la_dt.replace(tzinfo=timezone.utc)
+                if la_dt >= (now - timedelta(days=7)):
+                    active_week.append(r)
+            except ValueError:
+                continue
 
-            if expires_at:
-                # ✅ Стандартный fromisoformat без dateutil
-                exp_str = str(expires_at).replace("Z", "+00:00")
-                try:
-                    exp = datetime.fromisoformat(exp_str)
-                except ValueError:
-                    exp = now  # не распарсилось — считаем истёкшим
+        # ── Проверяем: уже активирован ли ЭТОТ мониторинг пользователем ──
+        this_record = next(
+            (r for r in user_rows if r.get("symbol") == symbol and r.get("exchange") == exchange),
+            None
+        )
+        already_active = this_record and this_record.get("last_alerted") and any(
+            r["id"] == this_record["id"] for r in active_week
+        )
 
-                if exp.tzinfo is None:
-                    exp = exp.replace(tzinfo=timezone.utc)
+        # Если этот конкретный мониторинг уже активен — просто возвращаем статус
+        if already_active:
+            used  = len(active_week)
+            remaining = max(0, WEEK_LIMIT - used)
+            return {"status": "ok", "remaining": remaining, "already_active": True}
 
-                if now > exp:
-                    supabase.table("crypto_monitors").update({
-                        "alerts_count": 1,
-                        "expires_at":   (now + timedelta(days=7)).isoformat(),
-                        "last_alerted": now.isoformat(),
-                        "price_at_add": m.get("last_price", 0),
-                    }).eq("id", m["id"]).execute()
-                    return {"status": "ok", "remaining": 2}
+        # ── Проверяем лимит ──
+        used = len(active_week)
+        if used >= WEEK_LIMIT:
+            # Находим ближайшую дату сброса (самый старый last_alerted + 7 дней)
+            oldest = min(active_week, key=lambda r: r.get("last_alerted", ""))
+            la_str = str(oldest["last_alerted"]).replace("Z", "+00:00")
+            try:
+                reset_dt = datetime.fromisoformat(la_str)
+                if reset_dt.tzinfo is None:
+                    reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+                reset_dt = reset_dt + timedelta(days=7)
+                delta    = reset_dt - now
+                hours    = int(delta.total_seconds() // 3600)
+                days_left = hours // 24
+                hrs_left  = hours % 24
+                if days_left > 0:
+                    reset_str = f"через {days_left} д. {hrs_left} ч."
+                else:
+                    reset_str = f"через {hrs_left} ч."
+            except Exception:
+                reset_str = "через 7 дней"
+            return {
+                "status":    "error",
+                "message":   f"Лимит исчерпан — 3 запуска в неделю",
+                "reset_in":  reset_str,
+            }
 
-            count = m.get("alerts_count") or 0
-            if count >= 3:
-                return {"status": "error", "message": "Лимит исчерпан — 3 запуска в неделю"}
-
-            new_count = count + 1
+        # ── Активируем ──
+        if this_record:
+            # Запись уже есть — обновляем last_alerted
             supabase.table("crypto_monitors").update({
-                "alerts_count": new_count,
                 "last_alerted": now.isoformat(),
-            }).eq("id", m["id"]).execute()
-            return {"status": "ok", "remaining": 3 - new_count}
-
+                "alerts_count": (this_record.get("alerts_count") or 0) + 1,
+            }).eq("id", this_record["id"]).execute()
         else:
+            # Создаём новую запись
             current_price = await fetch_crypto_price(symbol, exchange)
             supabase.table("crypto_monitors").insert({
                 "tg_id":        tg_id,
@@ -950,7 +990,9 @@ async def activate_monitor(request: Request):
                 "last_price":   current_price or 0,
                 "alert_pct":    5,
             }).execute()
-            return {"status": "ok", "remaining": 2}
+
+        remaining = WEEK_LIMIT - (used + 1)
+        return {"status": "ok", "remaining": remaining}
 
     except Exception as e:
         log.error("[ACTIVATE-MONITOR] %s", e)
