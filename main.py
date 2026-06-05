@@ -44,12 +44,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
 # ── FSM STATES ────────────────────────────────────────────────────────────────
 
 class AdminState(StatesGroup):
-    waiting_username    = State()   # ввод username для поиска
-    viewing_user        = State()   # просмотр пользователя
-    waiting_add_slots   = State()   # ввод числа слотов для добавления
-    waiting_broadcast   = State()   # ввод текста рассылки
-
-# Хранилище текущего tg_id просматриваемого пользователя (в FSM data)
+    waiting_username    = State()
+    viewing_user        = State()
+    waiting_add_slots   = State()
+    waiting_broadcast   = State()
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -60,9 +58,8 @@ def get_client_ip(request: Request) -> str:
             return v.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
-def escape_md2(text: str) -> str:
-    special = r"\_*[]()~`>#+-=|{}.!"
-    return "".join(("\\" + c) if c in special else c for c in str(text))
+def escape_html(text: str) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def safe_float(val, default: float = 0.0) -> float:
     try:
@@ -501,18 +498,18 @@ async def price_watcher():
                 change_pct = (new_px - old_px) / old_px * 100
                 if abs(change_pct) >= alert_pct:
                     direction = "📈 выросла" if change_pct > 0 else "📉 упала"
-                    sign      = "\\+" if change_pct > 0 else "\\-"
-                    label     = sym if "/" in sym else f"{sym} \\({exchange.upper()}\\)"
+                    sign      = "+" if change_pct > 0 else "-"
+                    label     = sym if "/" in sym else f"{sym} ({exchange.upper()})"
                     msg = (
-                        f"🔔 *{escape_md2(label)}* {direction} на "
-                        f"*{sign}{escape_md2(str(round(abs(change_pct), 2)))}%*\n"
-                        f"Было: `{escape_md2(fmt_price(old_px))}`\n"
-                        f"Сейчас: `{escape_md2(fmt_price(new_px))}`\n"
-                        f"_Monitor Space_"
+                        f"🔔 <b>{escape_html(label)}</b> {direction} на "
+                        f"<b>{sign}{escape_html(str(round(abs(change_pct), 2)))}%</b>\n"
+                        f"Было: <code>{escape_html(fmt_price(old_px))}</code>\n"
+                        f"Сейчас: <code>{escape_html(fmt_price(new_px))}</code>\n"
+                        f"<i>Monitor Space</i>"
                     )
                     if bot:
                         try:
-                            await bot.send_message(chat_id=tg_id, text=msg, parse_mode="MarkdownV2")
+                            await bot.send_message(chat_id=tg_id, text=msg, parse_mode="HTML")
                         except Exception as te:
                             log.warning("[ALERT TG] %s", te)
                     supabase.table("crypto_monitors").update({
@@ -543,20 +540,19 @@ def user_action_keyboard(target_tg_id: int, username: str) -> types.InlineKeyboa
     uid = str(target_tg_id)
     return types.InlineKeyboardMarkup(inline_keyboard=[
         [
-            types.InlineKeyboardButton(text="➕ Добавить слоты",     callback_data=f"admin:add_slots:{uid}"),
+            types.InlineKeyboardButton(text="➕ Добавить слоты",      callback_data=f"admin:add_slots:{uid}"),
             types.InlineKeyboardButton(text="🗑 Сбросить мониторинги", callback_data=f"admin:reset_monitors:{uid}"),
         ],
         [
-            types.InlineKeyboardButton(text="✉️ Написать юзеру",     callback_data=f"admin:msg_user:{uid}"),
-            types.InlineKeyboardButton(text="🔄 Обновить данные",    callback_data=f"admin:refresh_user:{uid}"),
+            types.InlineKeyboardButton(text="✉️ Написать юзеру",      callback_data=f"admin:msg_user:{uid}"),
+            types.InlineKeyboardButton(text="🔄 Обновить данные",     callback_data=f"admin:refresh_user:{uid}"),
         ],
         [
-            types.InlineKeyboardButton(text="◀️ Назад в панель",     callback_data="admin:back"),
+            types.InlineKeyboardButton(text="◀️ Назад в панель",      callback_data="admin:back"),
         ],
     ])
 
 async def get_user_info_text(tg_id: int) -> tuple[str, list]:
-    """Возвращает (текст, список мониторингов)"""
     if not supabase:
         return "❌ БД недоступна", []
     res = supabase.table("users").select("*").eq("tg_id", tg_id).execute()
@@ -567,7 +563,6 @@ async def get_user_info_text(tg_id: int) -> tuple[str, list]:
     mon_list  = monitors.data or []
     full_name = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
 
-    # Считаем активные за 7 дней
     now = datetime.now(timezone.utc)
     active_count = 0
     for m in mon_list:
@@ -587,22 +582,22 @@ async def get_user_info_text(tg_id: int) -> tuple[str, list]:
     for m in mon_list:
         la = m.get("last_alerted", "—")
         la_str = str(la)[:10] if la else "—"
-        mon_lines.append(f"  • {m['symbol']} \\({m['exchange']}\\) — последний запуск: {escape_md2(la_str)}")
+        mon_lines.append(f"  • {escape_html(m['symbol'])} ({escape_html(m['exchange'])}) — последний запуск: {escape_html(la_str)}")
     mon_text = "\n".join(mon_lines) if mon_lines else "  нет мониторингов"
 
     text = (
-        f"👤 *@{escape_md2(u.get('username',''))}*\n"
-        f"ID: `{tg_id}`\n"
-        f"Имя: {escape_md2(full_name)}\n"
-        f"IP рег: `{escape_md2(u.get('reg_ip',''))}`\n"
-        f"Последний IP: `{escape_md2(u.get('last_ip',''))}`\n"
-        f"Платформа: {escape_md2(u.get('platform',''))}\n"
+        f"👤 <b>@{escape_html(u.get('username',''))}</b>\n"
+        f"ID: <code>{tg_id}</code>\n"
+        f"Имя: {escape_html(full_name)}\n"
+        f"IP рег: <code>{escape_html(u.get('reg_ip',''))}</code>\n"
+        f"Последний IP: <code>{escape_html(u.get('last_ip',''))}</code>\n"
+        f"Платформа: {escape_html(u.get('platform',''))}\n"
         f"Язык: {u.get('language','')}\n"
         f"Визитов: {u.get('visit_count', 0)}\n"
-        f"Регистрация: {escape_md2(str(u.get('created_at',''))[:10])}\n"
-        f"Последний вход: {escape_md2(str(u.get('last_seen',''))[:10])}\n"
-        f"User\\-Agent: `{escape_md2((u.get('user_agent','') or '')[:60])}`\n\n"
-        f"📊 *Мониторинги \\({len(mon_list)} всего, {active_count}/3 активных за неделю\\):*\n"
+        f"Регистрация: {escape_html(str(u.get('created_at',''))[:10])}\n"
+        f"Последний вход: {escape_html(str(u.get('last_seen',''))[:10])}\n"
+        f"User-Agent: <code>{escape_html((u.get('user_agent','') or '')[:60])}</code>\n\n"
+        f"📊 <b>Мониторинги ({len(mon_list)} всего, {active_count}/3 активных за неделю):</b>\n"
         f"{mon_text}"
     )
     return text, mon_list
@@ -627,8 +622,8 @@ async def cmd_start(message: types.Message):
         )
     ]])
     await message.answer(
-        "👋 Привет\\! *Monitor Space* — мониторинг крипты и форекса в реальном времени\\.\n\nНажми кнопку ниже 👇",
-        reply_markup=kb, parse_mode="MarkdownV2"
+        "👋 Привет! <b>Monitor Space</b> — мониторинг крипты и форекса в реальном времени.\n\nНажми кнопку ниже 👇",
+        reply_markup=kb, parse_mode="HTML"
     )
 
 @dp.message(Command("admin"))
@@ -643,12 +638,12 @@ async def cmd_admin(message: types.Message, state: FSMContext):
     total_users    = len((supabase.table("users").select("id").execute()).data or [])
     total_monitors = len((supabase.table("crypto_monitors").select("id").execute()).data or [])
     await message.answer(
-        f"🛡 *Админ панель — Monitor Space*\n\n"
-        f"👥 Пользователей: *{total_users}*\n"
-        f"📡 Мониторингов в БД: *{total_monitors}*\n\n"
+        f"🛡 <b>Админ панель — Monitor Space</b>\n\n"
+        f"👥 Пользователей: <b>{total_users}</b>\n"
+        f"📡 Мониторингов в БД: <b>{total_monitors}</b>\n\n"
         f"Выбери действие:",
         reply_markup=admin_main_keyboard(),
-        parse_mode="MarkdownV2"
+        parse_mode="HTML"
     )
 
 # ── CALLBACK-ХЕНДЛЕРЫ АДМИНКИ ─────────────────────────────────────────────────
@@ -663,12 +658,12 @@ async def cb_admin_back(call: types.CallbackQuery, state: FSMContext):
     total_users    = len((supabase.table("users").select("id").execute()).data or [])
     total_monitors = len((supabase.table("crypto_monitors").select("id").execute()).data or [])
     await call.message.edit_text(
-        f"🛡 *Админ панель — Monitor Space*\n\n"
-        f"👥 Пользователей: *{total_users}*\n"
-        f"📡 Мониторингов в БД: *{total_monitors}*\n\n"
+        f"🛡 <b>Админ панель — Monitor Space</b>\n\n"
+        f"👥 Пользователей: <b>{total_users}</b>\n"
+        f"📡 Мониторингов в БД: <b>{total_monitors}</b>\n\n"
         f"Выбери действие:",
         reply_markup=admin_main_keyboard(),
-        parse_mode="MarkdownV2"
+        parse_mode="HTML"
     )
     await call.answer()
 
@@ -678,11 +673,11 @@ async def cb_find_user(call: types.CallbackQuery, state: FSMContext):
         return await call.answer("⛔")
     await state.set_state(AdminState.waiting_username)
     await call.message.edit_text(
-        "🔍 Введи *username* пользователя \\(без @\\) или его *Telegram ID*:",
+        "🔍 Введи <b>username</b> пользователя (без @) или его <b>Telegram ID</b>:",
         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
             types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
         ]]),
-        parse_mode="MarkdownV2"
+        parse_mode="HTML"
     )
     await call.answer()
 
@@ -697,56 +692,55 @@ async def cb_stats(call: types.CallbackQuery, state: FSMContext):
         monitors = supabase.table("crypto_monitors").select("exchange, last_alerted, symbol").execute().data or []
         now = datetime.now(timezone.utc)
 
-        # Новые за 24ч и 7д
         new_24h = sum(1 for u in users if u.get("created_at") and
                       datetime.fromisoformat(str(u["created_at"]).replace("Z","+00:00")).replace(tzinfo=timezone.utc) >= now - timedelta(hours=24))
         new_7d  = sum(1 for u in users if u.get("created_at") and
                       datetime.fromisoformat(str(u["created_at"]).replace("Z","+00:00")).replace(tzinfo=timezone.utc) >= now - timedelta(days=7))
 
-        # Активные мониторинги за 7д
         active_mon = sum(1 for m in monitors if m.get("last_alerted") and
                          datetime.fromisoformat(str(m["last_alerted"]).replace("Z","+00:00")).replace(tzinfo=timezone.utc) >= now - timedelta(days=7))
 
-        # Топ платформы
         platforms: dict = {}
         for u in users:
             p = (u.get("platform") or "unknown").lower()[:20]
             platforms[p] = platforms.get(p, 0) + 1
         top_plat = sorted(platforms.items(), key=lambda x: x[1], reverse=True)[:4]
-        plat_str = "\n".join(f"  {escape_md2(p)}: {c}" for p, c in top_plat) or "  нет данных"
+        plat_str = "\n".join(f"  {escape_html(p)}: {c}" for p, c in top_plat) or "  нет данных"
 
-        # Топ монеты
         syms: dict = {}
         for m in monitors:
             s = m.get("symbol","")
             syms[s] = syms.get(s, 0) + 1
         top_sym = sorted(syms.items(), key=lambda x: x[1], reverse=True)[:5]
-        sym_str = "\n".join(f"  {escape_md2(s)}: {c}" for s, c in top_sym) or "  нет данных"
+        sym_str = "\n".join(f"  {escape_html(s)}: {c}" for s, c in top_sym) or "  нет данных"
 
         total_visits = sum(u.get("visit_count", 0) or 0 for u in users)
 
         text = (
-            f"📊 *Статистика Monitor Space*\n\n"
-            f"👥 Всего пользователей: *{len(users)}*\n"
-            f"  \\+{new_24h} за 24ч, \\+{new_7d} за 7д\n"
-            f"📲 Всего визитов: *{total_visits}*\n\n"
-            f"📡 Мониторингов в БД: *{len(monitors)}*\n"
-            f"  Активных за 7д: *{active_mon}*\n\n"
-            f"📱 *Топ платформы:*\n{plat_str}\n\n"
-            f"🪙 *Топ монеты:*\n{sym_str}"
+            f"📊 <b>Статистика Monitor Space</b>\n\n"
+            f"👥 Всего пользователей: <b>{len(users)}</b>\n"
+            f"  +{new_24h} за 24ч, +{new_7d} за 7д\n"
+            f"📲 Всего визитов: <b>{total_visits}</b>\n\n"
+            f"📡 Мониторингов в БД: <b>{len(monitors)}</b>\n"
+            f"  Активных за 7д: <b>{active_mon}</b>\n\n"
+            f"📱 <b>Топ платформы:</b>\n{plat_str}\n\n"
+            f"🪙 <b>Топ монеты:</b>\n{sym_str}"
         )
         await call.message.edit_text(
             text,
             reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
                 types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
             ]]),
-            parse_mode="MarkdownV2"
+            parse_mode="HTML"
         )
     except Exception as e:
-        await call.message.edit_text(f"⚠️ Ошибка: {escape_md2(str(e))}",
-                                     reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
-                                         types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
-                                     ]]), parse_mode="MarkdownV2")
+        await call.message.edit_text(
+            f"⚠️ Ошибка: {escape_html(str(e))}",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
+            ]]),
+            parse_mode="HTML"
+        )
     await call.answer()
 
 @dp.callback_query(F.data == "admin:user_list")
@@ -765,14 +759,14 @@ async def cb_user_list(call: types.CallbackQuery, state: FSMContext):
             for u in users:
                 name = u.get("username") or u.get("first_name") or "—"
                 seen = str(u.get("last_seen",""))[:10]
-                lines.append(f"• @{escape_md2(name)} \\(`{u['tg_id']}`\\) — {escape_md2(seen)}, визитов: {u.get('visit_count',0)}")
-        text = "👥 *Последние 20 пользователей* \\(по дате активности\\):\n\n" + "\n".join(lines)
+                lines.append(f"• @{escape_html(name)} (<code>{u['tg_id']}</code>) — {escape_html(seen)}, визитов: {u.get('visit_count',0)}")
+        text = "👥 <b>Последние 20 пользователей</b> (по дате активности):\n\n" + "\n".join(lines)
         await call.message.edit_text(
             text,
             reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
                 types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
             ]]),
-            parse_mode="MarkdownV2"
+            parse_mode="HTML"
         )
     except Exception as e:
         await call.answer(f"Ошибка: {e}", show_alert=True)
@@ -784,18 +778,16 @@ async def cb_broadcast(call: types.CallbackQuery, state: FSMContext):
         return await call.answer("⛔")
     await state.set_state(AdminState.waiting_broadcast)
     await call.message.edit_text(
-        "📢 Введи текст рассылки\\.\n"
-        "Поддерживается *MarkdownV2*\\.\n"
-        "Будет отправлено *всем* пользователям в БД\\.\n\n"
+        "📢 Введи текст рассылки.\n"
+        "Поддерживается <b>HTML</b>.\n"
+        "Будет отправлено <b>всем</b> пользователям в БД.\n\n"
         "Отправь /cancel чтобы отменить:",
         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
             types.InlineKeyboardButton(text="◀️ Отмена", callback_data="admin:back")
         ]]),
-        parse_mode="MarkdownV2"
+        parse_mode="HTML"
     )
     await call.answer()
-
-# Кнопки для просматриваемого пользователя
 
 @dp.callback_query(F.data.startswith("admin:add_slots:"))
 async def cb_add_slots(call: types.CallbackQuery, state: FSMContext):
@@ -805,14 +797,14 @@ async def cb_add_slots(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminState.waiting_add_slots)
     await state.update_data(target_tg_id=target_id)
     await call.message.edit_text(
-        f"➕ Добавить слоты пользователю `{target_id}`\\.\n\n"
-        f"Введи число слотов \\(1\\-10\\)\\.\n"
-        f"Слоты добавляются путём сброса `last_alerted` у старых записей \\(освобождает места в недельном лимите\\)\\.\n\n"
+        f"➕ Добавить слоты пользователю <code>{target_id}</code>.\n\n"
+        f"Введи число слотов (1-10).\n"
+        f"Слоты добавляются путём сброса <code>last_alerted</code> у старых записей (освобождает места в недельном лимите).\n\n"
         f"Отправь число:",
         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
             types.InlineKeyboardButton(text="◀️ Отмена", callback_data=f"admin:refresh_user:{target_id}")
         ]]),
-        parse_mode="MarkdownV2"
+        parse_mode="HTML"
     )
     await call.answer()
 
@@ -824,14 +816,12 @@ async def cb_reset_monitors(call: types.CallbackQuery, state: FSMContext):
     if not supabase:
         return await call.answer("БД недоступна", show_alert=True)
     try:
-        # Сбрасываем last_alerted у всех записей — полный сброс недельного лимита
         supabase.table("crypto_monitors").update({"last_alerted": None}).eq("tg_id", target_id).execute()
         await call.answer("✅ Мониторинги сброшены — лимит обнулён", show_alert=True)
-        # Обновляем карточку пользователя
         text, _ = await get_user_info_text(target_id)
         user_res = supabase.table("users").select("username").eq("tg_id", target_id).execute()
         uname    = (user_res.data[0].get("username","") if user_res.data else "") or str(target_id)
-        await call.message.edit_text(text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="MarkdownV2")
+        await call.message.edit_text(text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="HTML")
     except Exception as e:
         await call.answer(f"Ошибка: {e}", show_alert=True)
 
@@ -841,15 +831,15 @@ async def cb_msg_user(call: types.CallbackQuery, state: FSMContext):
         return await call.answer("⛔")
     target_id = int(call.data.split(":")[2])
     await state.set_state(AdminState.waiting_broadcast)
-    await state.update_data(broadcast_target=target_id)  # одиночная отправка
+    await state.update_data(broadcast_target=target_id)
     await call.message.edit_text(
-        f"✉️ Введи сообщение для пользователя `{target_id}`\\.\n"
-        f"Поддерживается *MarkdownV2*\\.\n\n"
+        f"✉️ Введи сообщение для пользователя <code>{target_id}</code>.\n"
+        f"Поддерживается <b>HTML</b>.\n\n"
         f"Отправь /cancel чтобы отменить:",
         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
             types.InlineKeyboardButton(text="◀️ Отмена", callback_data=f"admin:refresh_user:{target_id}")
         ]]),
-        parse_mode="MarkdownV2"
+        parse_mode="HTML"
     )
     await call.answer()
 
@@ -863,7 +853,7 @@ async def cb_refresh_user(call: types.CallbackQuery, state: FSMContext):
     text, _ = await get_user_info_text(target_id)
     user_res = supabase.table("users").select("username").eq("tg_id", target_id).execute()
     uname    = (user_res.data[0].get("username","") if user_res.data else "") or str(target_id)
-    await call.message.edit_text(text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="MarkdownV2")
+    await call.message.edit_text(text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="HTML")
     await call.answer("🔄 Обновлено")
 
 # ── FSM MESSAGE HANDLERS ──────────────────────────────────────────────────────
@@ -877,18 +867,17 @@ async def fsm_waiting_username(message: types.Message, state: FSMContext):
         return
     query = message.text.strip().lstrip("@")
     try:
-        # Ищем по username или по tg_id
         if query.isdigit():
             res = supabase.table("users").select("*").eq("tg_id", int(query)).execute()
         else:
             res = supabase.table("users").select("*").eq("username", query).execute()
         if not res.data:
             await message.answer(
-                f"❌ Пользователь *{escape_md2(query)}* не найден в базе\\.",
+                f"❌ Пользователь <b>{escape_html(query)}</b> не найден в базе.",
                 reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
                     types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
                 ]]),
-                parse_mode="MarkdownV2"
+                parse_mode="HTML"
             )
             return
         u         = res.data[0]
@@ -897,9 +886,9 @@ async def fsm_waiting_username(message: types.Message, state: FSMContext):
         text, _   = await get_user_info_text(target_id)
         await state.set_state(AdminState.viewing_user)
         await state.update_data(target_tg_id=target_id)
-        await message.answer(text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="MarkdownV2")
+        await message.answer(text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="HTML")
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка: {escape_md2(str(e))}", parse_mode="MarkdownV2")
+        await message.answer(f"⚠️ Ошибка: {escape_html(str(e))}", parse_mode="HTML")
 
 @dp.message(AdminState.waiting_add_slots)
 async def fsm_waiting_add_slots(message: types.Message, state: FSMContext):
@@ -920,7 +909,6 @@ async def fsm_waiting_add_slots(message: types.Message, state: FSMContext):
         await state.clear()
         return
     try:
-        # Берём самые старые активные записи и сбрасываем им last_alerted
         monitors = supabase.table("crypto_monitors").select("id, last_alerted") \
             .eq("tg_id", target_id).execute().data or []
         now = datetime.now(timezone.utc)
@@ -937,7 +925,6 @@ async def fsm_waiting_add_slots(message: types.Message, state: FSMContext):
                     active.append((la_dt, m["id"]))
             except Exception:
                 pass
-        # Сортируем по дате (сбрасываем старейшие)
         active.sort(key=lambda x: x[0])
         freed = 0
         for _, mid in active[:slots]:
@@ -947,17 +934,16 @@ async def fsm_waiting_add_slots(message: types.Message, state: FSMContext):
         uname_res = supabase.table("users").select("username").eq("tg_id", target_id).execute()
         uname     = (uname_res.data[0].get("username","") if uname_res.data else "") or str(target_id)
         await message.answer(
-            f"✅ Освобождено *{freed}* слот\\(ов\\) для пользователя @{escape_md2(uname)}\\.\n"
-            f"Теперь он может запустить ещё {freed} мониторинг\\(ов\\) на этой неделе\\.",
-            parse_mode="MarkdownV2"
+            f"✅ Освобождено <b>{freed}</b> слот(ов) для пользователя @{escape_html(uname)}.\n"
+            f"Теперь он может запустить ещё {freed} мониторинг(ов) на этой неделе.",
+            parse_mode="HTML"
         )
-        # Показываем обновлённую карточку
         card_text, _ = await get_user_info_text(target_id)
-        await message.answer(card_text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="MarkdownV2")
+        await message.answer(card_text, reply_markup=user_action_keyboard(target_id, uname), parse_mode="HTML")
         await state.set_state(AdminState.viewing_user)
         await state.update_data(target_tg_id=target_id)
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка: {escape_md2(str(e))}", parse_mode="MarkdownV2")
+        await message.answer(f"⚠️ Ошибка: {escape_html(str(e))}", parse_mode="HTML")
 
 @dp.message(AdminState.waiting_broadcast)
 async def fsm_waiting_broadcast(message: types.Message, state: FSMContext):
@@ -971,35 +957,32 @@ async def fsm_waiting_broadcast(message: types.Message, state: FSMContext):
         await message.answer("❌ БД или бот недоступны")
         return
     data      = await state.get_data()
-    single_id = data.get("broadcast_target")  # если задан — отправляем одному
+    single_id = data.get("broadcast_target")
 
     try:
         if single_id:
-            # Одиночное сообщение
-            await bot.send_message(chat_id=single_id, text=message.text, parse_mode="MarkdownV2")
-            await message.answer(f"✅ Сообщение отправлено пользователю `{single_id}`\\.", parse_mode="MarkdownV2")
+            await bot.send_message(chat_id=single_id, text=message.text, parse_mode="HTML")
+            await message.answer(f"✅ Сообщение отправлено пользователю <code>{single_id}</code>.", parse_mode="HTML")
         else:
-            # Рассылка всем
             users = supabase.table("users").select("tg_id").execute().data or []
             ok, fail = 0, 0
-            status_msg = await message.answer(f"📢 Начинаю рассылку для {len(users)} пользователей\\.\\.\\.", parse_mode="MarkdownV2")
+            status_msg = await message.answer(f"📢 Начинаю рассылку для {len(users)} пользователей...", parse_mode="HTML")
             for u in users:
                 try:
-                    await bot.send_message(chat_id=u["tg_id"], text=message.text, parse_mode="MarkdownV2")
+                    await bot.send_message(chat_id=u["tg_id"], text=message.text, parse_mode="HTML")
                     ok += 1
                 except Exception:
                     fail += 1
-                await asyncio.sleep(0.05)  # rate limit
+                await asyncio.sleep(0.05)
             await status_msg.edit_text(
-                f"✅ Рассылка завершена\\!\n✔️ Доставлено: *{ok}*\n❌ Ошибок: *{fail}*",
-                parse_mode="MarkdownV2"
+                f"✅ Рассылка завершена!\n✔️ Доставлено: <b>{ok}</b>\n❌ Ошибок: <b>{fail}</b>",
+                parse_mode="HTML"
             )
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка: {escape_md2(str(e))}", parse_mode="MarkdownV2")
+        await message.answer(f"⚠️ Ошибка: {escape_html(str(e))}", parse_mode="HTML")
 
     await state.clear()
 
-# Любое другое сообщение не от admina — игнорируем
 @dp.message()
 async def handle_other(message: types.Message, state: FSMContext):
     pass
@@ -1161,10 +1144,6 @@ async def admin_get_user(username: str, request: Request):
 
 @app.post("/activate-monitor")
 async def activate_monitor(request: Request):
-    """
-    Глобальный лимит: 3 уникальных мониторинга за 7 дней на пользователя.
-    Счётчик считается по числу записей с last_alerted > (now - 7d).
-    """
     try:
         data     = await request.json()
         tg_id    = data.get("tg_id")
