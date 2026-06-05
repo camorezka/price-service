@@ -504,7 +504,7 @@ async def price_watcher():
                         f"🔔 <b>{escape_html(label)}</b> {direction} на "
                         f"<b>{sign}{escape_html(str(round(abs(change_pct), 2)))}%</b>\n"
                         f"Было: <code>{escape_html(fmt_price(old_px))}</code>\n"
-                        f"Сейчас: <code>{escape_html(fmt_price(new_px))}</code>\n"
+                        f"Сейчас: <code>{escape_html(fmt_price(new_px))}</code>\n\n"
                         f"<i>Monitor Space</i>"
                     )
                     if bot:
@@ -622,7 +622,7 @@ async def cmd_start(message: types.Message):
         )
     ]])
     await message.answer(
-        "👋 Привет! <b>Monitor Space</b> — мониторинг крипты и форекса в реальном времени.\n\nНажми кнопку ниже 👇",
+        f"👋 Привет, {message.from_user.first_name}!\n<b>Monitor Space</b> — мониторинг крипты и форекса в реальном времени.\n\nНажми кнопку ниже чтобы начать 👇",
         reply_markup=kb, parse_mode="HTML"
     )
 
